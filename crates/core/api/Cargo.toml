@@ -1,0 +1,24 @@
+[package]
+name = "cs-api"
+description = "Plugin-facing vocabulary: Wire, ServiceDef, Sampler, Handler, ServiceCtx handles."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cs-util.workspace = true
+cs-async-util.workspace = true
+bytes.workspace = true
+prost.workspace = true
+
+[dev-dependencies]
+cs-async-util = { workspace = true, features = ["test-util"] }
+
+[features]
+# `test_support::FakeEngine`: lets a plugin crate unit-test its samplers and
+# handlers against a recording stand-in for the engine.
+test-util = ["cs-async-util/test-util"]
+
+[lints]
+workspace = true

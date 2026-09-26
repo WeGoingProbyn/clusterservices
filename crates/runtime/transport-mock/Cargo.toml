@@ -1,0 +1,19 @@
+[package]
+name = "cs-transport-mock"
+description = "In-process transport with fault injection, for tests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cs-transport.workspace = true
+cs-util.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
+
+[lints]
+workspace = true

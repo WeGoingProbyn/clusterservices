@@ -1,0 +1,12 @@
+[package]
+name = "cs-plugin-cgroup"
+description = "Per-job cgroup v2 sampler."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

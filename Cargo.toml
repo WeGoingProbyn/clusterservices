@@ -1,0 +1,36 @@
+[workspace]
+resolver = "3"
+members = ["crates/core/*", "crates/runtime/*", "crates/plugins/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+# core
+cs-util = { path = "crates/core/util" }
+cs-async-util = { path = "crates/core/async-util" }
+cs-api = { path = "crates/core/api" }
+# runtime
+cs-transport = { path = "crates/runtime/transport" }
+cs-transport-mock = { path = "crates/runtime/transport-mock" }
+cs-engine = { path = "crates/runtime/engine" }
+cs-testkit = { path = "crates/runtime/testkit" }
+# third party
+bytes = "1"
+prost = "0.14"
+prost-build = "0.14"
+protox = "0.9"
+tokio = "1"
+tracing = "0.1"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+todo = "warn"
+unwrap_used = "warn"
+expect_used = "warn"

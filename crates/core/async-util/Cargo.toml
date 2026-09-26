@@ -1,0 +1,22 @@
+[package]
+name = "cs-async-util"
+description = "Runtime-agnostic async primitives: ShutdownSignal, Clock, CommandHandle."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cs-util.workspace = true
+
+# No dev-dependencies either: the futures here are tested with the tiny
+# park/unpark executor in `src/test_util.rs`, so nothing in crates/core pulls in
+# a runtime, not even for `cargo test`.
+
+[features]
+# A tiny park/unpark `block_on`, for crates that must not depend on a runtime
+# but still need to await their own futures in tests.
+test-util = []
+
+[lints]
+workspace = true

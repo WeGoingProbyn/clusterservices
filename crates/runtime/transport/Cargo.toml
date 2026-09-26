@@ -1,0 +1,19 @@
+[package]
+name = "cs-transport"
+description = "Transport traits, Frame, and the frame protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+cs-util.workspace = true
+bytes.workspace = true
+prost.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[lints]
+workspace = true

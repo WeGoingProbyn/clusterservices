@@ -1,0 +1,199 @@
+syntax = "proto3";
+
+// The clusterservices frame protocol: everything that crosses a connection.
+//
+// This schema is the wire contract. The hand-written types in `src/frame.rs` are
+// what the engine actually manipulates; these messages exist for encoding and for
+// transports that speak protobuf natively (the gRPC transport streams `Frame`
+// directly over `rpc Session(stream Frame) returns (stream Frame)`).
+//
+// Compatibility rules: fields are only ever added, never renumbered or reused,
+// and every enum keeps its `_UNSPECIFIED = 0` member so an older peer decodes a
+// newer value as "unspecified" rather than silently mis-parsing it. The decoder
+// rejects `_UNSPECIFIED` explicitly.
+package cs.frame.v1;
+
+// One unit of transfer. Exactly one body field must be set; a frame with none is
+// rejected on decode.
+//
+// There is deliberately no lane field: which lane a frame belongs to follows from
+// its body (data on the data lane, everything else on control), so the two can
+// never disagree.
+message Frame {
+  oneof body {
+    // Metrics from a service on an agent.
+    Data data = 1;
+    // First frame an agent sends after connecting.
+    Hello hello = 2;
+    // Last frame either side sends before a clean close.
+    Goodbye goodbye = 3;
+    // An instruction for a service, or for a whole agent.
+    Command command = 4;
+    // The answer to exactly one command.
+    CommandResult command_result = 5;
+    // Liveness only.
+    Heartbeat heartbeat = 6;
+  }
+}
+
+// Metrics produced by one service, already encoded by the plugin.
+message Data {
+  // Routing key: the service's `ServiceDef::NAME`. Never empty.
+  string service = 1;
+  // The service's `ServiceDef::VERSION`, so a version skew can be reported
+  // instead of mis-parsed.
+  uint32 service_version = 2;
+  // The plugin's own encoded message. Opaque to the transport and the engine.
+  bytes payload = 3;
+
+  // Chunking, for a message larger than the transport's maximum frame size.
+  // `chunk_count` is 0 for an unchunked message, in which case the other two
+  // fields are 0 as well.
+  //
+  // Reassembly is per (service, message_id); chunks of one message arrive in
+  // order on the same lane.
+  uint64 message_id = 4;
+  // Position of this chunk, 0-based. Must be less than `chunk_count`.
+  uint32 chunk_index = 5;
+  // Total chunks in this message. 0 means "not chunked".
+  uint32 chunk_count = 6;
+}
+
+// An agent introducing itself. Sent once, before any data.
+message Hello {
+  // Node name, as the cluster knows it. Never empty — it is how the server
+  // addresses commands back to this agent.
+  string node = 1;
+  // Frame protocol version. A mismatch is fatal to the connection.
+  uint32 protocol = 2;
+  // Agent build identifier, for operators. Advisory only.
+  string build = 3;
+  // Every service this agent runs, so the server can answer a command for a
+  // service the node does not have without a round trip.
+  repeated ServiceInfo services = 4;
+}
+
+// One entry in a `Hello`'s service list.
+message ServiceInfo {
+  // The service's `ServiceDef::NAME`.
+  string name = 1;
+  // The service's `ServiceDef::VERSION`.
+  uint32 version = 2;
+}
+
+// A clean close, with the reason. Either side may send it.
+message Goodbye {
+  // Why the sender is going away.
+  GoodbyeReason reason = 1;
+  // Human-readable detail for the log. Advisory only.
+  string detail = 2;
+}
+
+// Why a peer is closing.
+enum GoodbyeReason {
+  // Never sent; rejected on decode.
+  GOODBYE_REASON_UNSPECIFIED = 0;
+  // Going away and not coming back. Do not reconnect.
+  GOODBYE_REASON_SHUTDOWN = 1;
+  // Going away briefly. Reconnect with the usual backoff.
+  GOODBYE_REASON_RESTART = 2;
+  // Closing because of an error, described in `detail`.
+  GOODBYE_REASON_ERROR = 3;
+}
+
+// An instruction for one service, or for a whole agent.
+message Command {
+  // Unique per connection. The matching CommandResult carries the same id.
+  uint64 id = 1;
+  // Target service name, or empty for the whole agent.
+  string service = 2;
+  // Which command.
+  CommandKind kind = 3;
+  // Deliver without asking the service whether it consents. Still runs
+  // `on_shutdown` under the shutdown deadline.
+  bool force = 4;
+  // How much longer this command is worth delivering, in milliseconds, counted
+  // from when it was *sent*.
+  //
+  // Relative, not absolute, and recomputed by the sender each time the command
+  // leaves a queue — so expiry needs no clock synchronisation between server and
+  // node. 0 means no expiry.
+  uint64 ttl_ms = 5;
+  // The service's own encoded command. Set only for COMMAND_KIND_CUSTOM.
+  bytes payload = 6;
+}
+
+// Which command is being issued.
+enum CommandKind {
+  // Never sent; rejected on decode.
+  COMMAND_KIND_UNSPECIFIED = 0;
+  // Stop the target and leave it stopped.
+  COMMAND_KIND_SHUTDOWN = 1;
+  // Stop the target and rebuild it from its factory.
+  COMMAND_KIND_RESTART = 2;
+  // A command the service defined for itself, in `payload`.
+  COMMAND_KIND_CUSTOM = 3;
+}
+
+// The answer to exactly one command.
+message CommandResult {
+  // The id of the command being answered.
+  uint64 id = 1;
+  // How it turned out.
+  Outcome outcome = 2;
+  // Why it was refused. Set only for OUTCOME_REJECTED.
+  string reason = 3;
+  // What went wrong on the far side. Set only for OUTCOME_FAILED.
+  ErrorTrace error = 4;
+}
+
+// How a command turned out.
+enum Outcome {
+  // Never sent; rejected on decode.
+  OUTCOME_UNSPECIFIED = 0;
+  // Accepted and acted on.
+  OUTCOME_OK = 1;
+  // The service does not implement this custom command.
+  OUTCOME_UNSUPPORTED = 2;
+  // The service refused; see `reason`.
+  OUTCOME_REJECTED = 3;
+  // Never delivered: it outlived its ttl while the node was disconnected.
+  OUTCOME_EXPIRED = 4;
+  // The target node does not run the named service.
+  OUTCOME_UNKNOWN_SERVICE = 5;
+  // The far side tried and failed; see `error`.
+  OUTCOME_FAILED = 6;
+}
+
+// A flattened `cs_util::Error` chain, so a failure keeps its shape across the
+// network and an operator sees the remote trace under the local one.
+message ErrorTrace {
+  // Node the error happened on.
+  string node = 1;
+  // `ErrorKind::as_str()` of the outermost frame — how to react. An unrecognised
+  // value is kept verbatim in the rebuilt message rather than becoming a new
+  // kind.
+  string kind = 2;
+  // Outermost frame first, matching `Error::chain()` order.
+  repeated TraceFrame frames = 3;
+}
+
+// One frame of a flattened error chain.
+message TraceFrame {
+  // The frame's message.
+  string message = 1;
+  // Source file it was created in, empty for a frame that came from a foreign
+  // error's own source chain.
+  string file = 2;
+  // Line in `file`. 0 when `file` is empty.
+  uint32 line = 3;
+}
+
+// Proof of life, sent on the control lane when a connection would otherwise be
+// idle.
+message Heartbeat {
+  // Sender's wall clock in milliseconds, for operator-facing diagnostics only.
+  // Never used for expiry or ordering decisions, both of which would need clock
+  // synchronisation this protocol deliberately avoids.
+  uint64 sent_unix_ms = 1;
+}
