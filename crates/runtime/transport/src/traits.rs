@@ -18,10 +18,9 @@ use crate::{Capabilities, Endpoint, Frame};
 ///
 /// - **Frames arrive whole, in order, exactly once, per lane.** A partial frame
 ///   is a dead connection, not a short read.
-/// - **A clean close is distinguishable from a broken one.**
-///   [`FrameRx::recv`] returns `Ok(None)` for the former and an error with
-///   [`ErrorKind::Transport`](cs_util::ErrorKind::Transport) for the latter, which
-///   is what tells the engine to reconnect.
+/// - **A close is reported, not inferred.** [`FrameRx::recv`] returns `Ok(None)`
+///   once the peer has finished. Whether it *meant* to is not a transport
+///   question — see [`FrameTx::close`].
 /// - **Errors are classified.** Anything worth retrying —
 ///   refused connection, reset, timeout — must carry a retryable kind, or the
 ///   engine will treat a transient outage as fatal.
@@ -101,10 +100,15 @@ pub trait FrameTx: Send + 'static {
         async { Ok(()) }
     }
 
-    /// Close cleanly, so the peer's [`FrameRx::recv`] returns `Ok(None)`.
+    /// Close, so the peer's [`FrameRx::recv`] returns `Ok(None)`.
     ///
-    /// Sent after `Goodbye`. Dropping the half instead is a broken close, and the
-    /// peer will treat it as one.
+    /// Sent after `Goodbye` — and the ordering is what carries the meaning, because
+    /// **a transport cannot be asked to distinguish an intended close from a
+    /// dropped connection.** Over TCP both send a FIN and the peer sees exactly the
+    /// same thing. A transport with an in-band close marker may report a dropped
+    /// half as a failure instead, and the mock does, but nothing above may depend
+    /// on it: an end of stream with no `Goodbye` before it means the peer went
+    /// away, and the engine reconnects.
     fn close(&mut self) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -113,12 +117,19 @@ pub trait FrameRx: Send + 'static {
     /// Wait for the next frame.
     ///
     /// - `Ok(Some(frame))` — a whole frame.
-    /// - `Ok(None)` — the peer closed cleanly. Nothing more will arrive.
+    /// - `Ok(None)` — the peer has finished. Nothing more will arrive.
     /// - `Err(_)` — the connection broke. Retryable kinds mean "reconnect".
     ///
     /// A frame that fails to decode is
     /// [`ErrorKind::Decode`](cs_util::ErrorKind::Decode), not
     /// [`Transport`](cs_util::ErrorKind::Transport): retrying will not fix a peer
     /// that is speaking nonsense.
+    ///
+    /// **`Decode` may only be returned when exactly one frame's bytes have been
+    /// consumed and the stream is still framed.** The engine responds to it by
+    /// reading the next frame, so a transport that has lost frame alignment — a
+    /// length prefix it could not trust, say — must report
+    /// [`Transport`](cs_util::ErrorKind::Transport) instead and let the connection
+    /// be rebuilt.
     fn recv(&mut self) -> impl Future<Output = Result<Option<Frame>>> + Send;
 }

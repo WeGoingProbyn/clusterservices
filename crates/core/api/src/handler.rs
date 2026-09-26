@@ -4,6 +4,22 @@ use cs_util::Result;
 
 use crate::{Data, ServiceBound, ServiceCtx};
 
+/// Who sent a message, and what they said they were.
+///
+/// A handler needs this for the obvious reason — metrics are worthless without
+/// knowing which node they describe — and for the less obvious one: a command is
+/// addressed to a node by name, so this is what makes `ctx.command(origin.node,
+/// ..)` possible from inside a handler.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Origin<'a> {
+    /// The sender's node name, exactly as it gave in its `Hello`.
+    pub node: &'a str,
+    /// The [`ServiceDef::VERSION`](crate::ServiceDef::VERSION) the sender declared
+    /// for this service, so a handler can notice a version skew rather than
+    /// misread the message.
+    pub service_version: u32,
+}
+
 /// The server side of a service: what happens to data when it arrives.
 ///
 /// Handlers are shared (`&self`, `Sync`) and run concurrently — the engine drives
@@ -16,7 +32,7 @@ use crate::{Data, ServiceBound, ServiceCtx};
 /// allocation in their own code.
 ///
 /// ```
-/// use cs_api::{Handler, NoCommand, ServiceBound, ServiceCtx, ServiceDef};
+/// use cs_api::{Handler, NoCommand, Origin, ServiceBound, ServiceCtx, ServiceDef};
 /// use cs_util::Result;
 /// use std::sync::atomic::{AtomicU64, Ordering};
 ///
@@ -37,8 +53,14 @@ use crate::{Data, ServiceBound, ServiceCtx};
 /// }
 ///
 /// impl Handler for CpuWriter {
-///     async fn handle(&self, ctx: &ServiceCtx<Cpu>, msg: String) -> Result<()> {
-///         let _ = (ctx.node(), msg);
+///     async fn handle(
+///         &self,
+///         ctx: &ServiceCtx<Cpu>,
+///         from: Origin<'_>,
+///         msg: String,
+///     ) -> Result<()> {
+///         // `from.node` is which node this came from; `ctx.node()` is us.
+///         let _ = (from.node, ctx.node(), msg);
 ///         self.rows.fetch_add(1, Ordering::Relaxed);
 ///         Ok(())
 ///     }
@@ -53,6 +75,7 @@ pub trait Handler: ServiceBound + Send + Sync + 'static {
     fn handle(
         &self,
         ctx: &ServiceCtx<Self::Service>,
+        from: Origin<'_>,
         msg: Data<Self>,
     ) -> impl Future<Output = Result<()>> + Send;
 
@@ -74,6 +97,13 @@ mod tests {
     use cs_util::{Error, ErrorKind};
     use std::sync::Mutex;
 
+    fn origin() -> Origin<'static> {
+        Origin {
+            node: "node-0042",
+            service_version: 1,
+        }
+    }
+
     struct Cpu;
 
     impl ServiceDef for Cpu {
@@ -93,7 +123,13 @@ mod tests {
     }
 
     impl Handler for Collect {
-        async fn handle(&self, _ctx: &ServiceCtx<Cpu>, msg: String) -> Result<()> {
+        async fn handle(
+            &self,
+            _ctx: &ServiceCtx<Cpu>,
+            from: Origin<'_>,
+            msg: String,
+        ) -> Result<()> {
+            assert_eq!(from.node, "node-0042", "the sender should be named");
             if msg.is_empty() {
                 return Err(Error::new(ErrorKind::Decode, "empty batch"));
             }
@@ -107,12 +143,12 @@ mod tests {
     }
 
     #[test]
-    fn a_handler_is_an_ordinary_async_fn() {
+    fn the_sender_is_named_and_the_handler_is_an_ordinary_async_fn() {
         let ctx = crate::test_support::fake_ctx::<Cpu>();
         let handler = Collect::default();
 
-        block_on(handler.handle(&ctx, "batch-1".into())).expect("handled");
-        block_on(handler.handle(&ctx, "batch-2".into())).expect("handled");
+        block_on(handler.handle(&ctx, origin(), "batch-1".into())).expect("handled");
+        block_on(handler.handle(&ctx, origin(), "batch-2".into())).expect("handled");
         assert_eq!(
             *handler.seen.lock().expect("lock"),
             ["batch-1".to_owned(), "batch-2".to_owned()]
@@ -123,7 +159,7 @@ mod tests {
     fn handler_errors_are_returned_not_panicked() {
         let ctx = crate::test_support::fake_ctx::<Cpu>();
         let handler = Collect::default();
-        let err = block_on(handler.handle(&ctx, String::new())).unwrap_err();
+        let err = block_on(handler.handle(&ctx, origin(), String::new())).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::Decode);
         assert!(handler.seen.lock().expect("lock").is_empty());
     }
@@ -135,7 +171,12 @@ mod tests {
             type Service = Cpu;
         }
         impl Handler for Bare {
-            async fn handle(&self, _ctx: &ServiceCtx<Cpu>, _msg: String) -> Result<()> {
+            async fn handle(
+                &self,
+                _ctx: &ServiceCtx<Cpu>,
+                _from: Origin<'_>,
+                _msg: String,
+            ) -> Result<()> {
                 Ok(())
             }
         }

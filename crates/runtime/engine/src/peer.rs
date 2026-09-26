@@ -18,7 +18,7 @@ use crate::chunk::{Reassembled, Reassembler, split};
 use crate::command::Commands;
 use crate::config::EngineConfig;
 use crate::queue::{Outgoing, PeerQueue};
-use crate::service::{AskKind, Builtin, ErasedHandler, ServiceHandle};
+use crate::service::{AskKind, Builtin, ErasedHandler, Sender, ServiceHandle};
 use crate::stats::SharedCounters;
 
 /// One connected peer.
@@ -346,7 +346,14 @@ async fn route(
                 },
             };
             if let Some(payload) = payload {
-                dispatch_data(&data.service, payload, peer, wiring, handlers);
+                dispatch_data(
+                    &data.service,
+                    data.service_version,
+                    payload,
+                    peer,
+                    wiring,
+                    handlers,
+                );
             }
             None
         }
@@ -378,6 +385,7 @@ async fn route(
 /// Hand a complete message to its handler, or count it as unroutable.
 fn dispatch_data(
     service: &str,
+    service_version: u32,
     payload: bytes::Bytes,
     peer: &Arc<Peer>,
     wiring: &Wiring,
@@ -394,8 +402,12 @@ fn dispatch_data(
         return;
     };
     wiring.counters.message_received(handler.id().name);
+    let from = Sender {
+        node: peer.node.clone(),
+        service_version,
+    };
     let handler = Arc::clone(handler);
-    handlers.spawn(handler.handle(payload));
+    handlers.spawn(handler.handle(from, payload));
 }
 
 /// Process commands for one connection, one at a time.

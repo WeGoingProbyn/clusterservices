@@ -16,6 +16,7 @@ cs-api = { path = "crates/core/api" }
 # runtime
 cs-transport = { path = "crates/runtime/transport" }
 cs-transport-mock = { path = "crates/runtime/transport-mock" }
+cs-transport-tcp = { path = "crates/runtime/transport-tcp" }
 cs-engine = { path = "crates/runtime/engine" }
 cs-testkit = { path = "crates/runtime/testkit" }
 # third party
@@ -25,6 +26,7 @@ prost-build = "0.14"
 protox = "0.9"
 tokio = "1"
 tracing = "0.1"
+tempfile = "3"
 
 [workspace.lints.rust]
 missing_docs = "warn"

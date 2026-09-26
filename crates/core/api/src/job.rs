@@ -1,6 +1,8 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
+use cs_util::Result;
+
 /// Which step of a job a cgroup belongs to.
 ///
 /// Slurm names step cgroups `step_<id>`, where the id is either a number or one
@@ -119,6 +121,31 @@ impl JobInfo {
 impl fmt::Display for JobInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.job_id, self.step)
+    }
+}
+
+/// Where the engine gets the node's job list.
+///
+/// Implemented by whatever can enumerate jobs — on a real node, a walk of the
+/// cgroup hierarchy, which is why this lives here rather than in the engine: the
+/// crate that knows how to find jobs is a plugin crate, and a plugin depends on
+/// `cs-api` and nothing else.
+///
+/// Called on a named worker thread, so blocking filesystem reads are expected and
+/// fine. An `Err` is logged and counted; the previous list stays in use, so one
+/// failed scan does not make every sampler think the node emptied.
+pub trait JobSource: Send + Sync + 'static {
+    /// Every job step currently on this node.
+    fn jobs(&self) -> Result<Vec<JobInfo>>;
+}
+
+/// A job source for a node with no jobs — the default, and what a server uses.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoJobs;
+
+impl JobSource for NoJobs {
+    fn jobs(&self) -> Result<Vec<JobInfo>> {
+        Ok(Vec::new())
     }
 }
 

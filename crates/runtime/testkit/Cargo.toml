@@ -7,6 +7,17 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+cs-api.workspace = true
+cs-async-util.workspace = true
+cs-engine.workspace = true
+cs-transport.workspace = true
+cs-transport-mock.workspace = true
+cs-util.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
 
 [lints]
 workspace = true

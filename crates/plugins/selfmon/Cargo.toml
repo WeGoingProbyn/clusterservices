@@ -1,14 +1,14 @@
 [package]
-name = "cs-plugin-cgroup"
-description = "Per-job cgroup v2 sampler."
+name = "cs-plugin-selfmon"
+description = "The agent watching itself: engine counters and per-plugin CPU."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-# Rule 2: a plugin depends on cs-api and nothing else. It re-exports bytes and
-# prost, which is all the generated code needs.
+# Rule 2, again: cs-api and nothing else. Notably no libc — see USER_HZ in
+# `SelfmonConfig`.
 cs-api.workspace = true
 
 [build-dependencies]
@@ -17,13 +17,16 @@ protox.workspace = true
 
 [dev-dependencies]
 cs-api = { workspace = true, features = ["test-util"] }
+# For the doctests only, which show how an agent registers this.
 cs-engine.workspace = true
+cs-testkit.workspace = true
 cs-transport.workspace = true
+cs-transport-mock.workspace = true
 cs-util.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
 
 [features]
-# `testing::FakeCgroups`: a throwaway cgroup tree on disk, for this crate's tests
-# and for anything else that wants to drive the sampler.
+# `testing::FakeProc`: a throwaway /proc/self tree.
 test-util = ["dep:tempfile"]
 
 [dependencies.tempfile]

@@ -95,12 +95,17 @@ impl NamedWorker {
 
 impl Drop for NamedWorker {
     fn drop(&mut self) {
-        // Closing the channel ends the loop; then wait, so a thread never
-        // outlives the engine that started it.
+        // Close the channel so the loop ends after the current job — and then
+        // **detach rather than join**.
+        //
+        // Joining here would make the engine hostage to plugin code: a sampler
+        // blocking in `on_shutdown` would hold this thread, and joining it would
+        // hold the runtime thread that is dropping us, straight through the
+        // shutdown deadline that exists to prevent exactly that. A detached
+        // thread owns everything it touches (`'static` jobs), finishes on its own,
+        // and dies with the process.
         self.jobs = None;
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        drop(self.thread.take());
     }
 }
 
@@ -248,18 +253,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dropping_a_worker_joins_its_thread() {
-        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let worker = NamedWorker::spawn("t/drop").expect("spawn");
+    async fn dropping_a_worker_does_not_wait_for_a_job_that_will_not_end() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::task::{Context, Poll, Waker};
+
+        // The engine must be able to walk away from plugin code that blocks, or
+        // the shutdown deadline means nothing.
+        let entered = std::sync::Arc::new(AtomicBool::new(false));
+        let released = std::sync::Arc::new(AtomicBool::new(false));
+        let worker = NamedWorker::spawn("t/stuck").expect("spawn");
+
         {
-            let flag = std::sync::Arc::clone(&flag);
-            worker
-                .run(move || flag.store(true, std::sync::atomic::Ordering::SeqCst))
-                .await
-                .expect("run");
+            let entered = std::sync::Arc::clone(&entered);
+            let released = std::sync::Arc::clone(&released);
+            let mut job = std::pin::pin!(worker.run(move || {
+                entered.store(true, AtomicOrdering::SeqCst);
+                while !released.load(AtomicOrdering::SeqCst) {
+                    thread::yield_now();
+                }
+            }));
+            // One poll queues the job; then stop waiting for it.
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(job.as_mut().poll(&mut cx), Poll::Pending));
         }
+        while !entered.load(AtomicOrdering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        let began = std::time::Instant::now();
         drop(worker);
-        assert!(flag.load(std::sync::atomic::Ordering::SeqCst));
+        let waited = began.elapsed();
+        assert!(
+            waited < std::time::Duration::from_millis(500),
+            "dropping a worker waited {waited:?} for a job that had not finished"
+        );
+
+        // The thread is still out there and ends on its own.
+        released.store(true, AtomicOrdering::SeqCst);
     }
 
     #[test]

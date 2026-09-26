@@ -96,16 +96,32 @@ crates/
                                   `MockNetwork` is a scoped value, not a global,
                                   so tests can't collide on an endpoint name.
                                   DONE.
-    transport-tcp/ cs-transport-tcp    tokio + length-delimited framing.
+    transport-tcp/ cs-transport-tcp   tokio + length-delimited framing
+                                  (4-byte big-endian length). Sets SO_REUSEADDR
+                                  so a restarted server can rebind at once, and
+                                  TCP_NODELAY so a command frame is not held
+                                  waiting for company. Passes the contract suite.
+                                  DONE.
     engine/        cs-engine      NodeEngine, peer table, lanes, command queues,
                                   service registry + supervision, shutdown,
                                   TokioClock, JobSource. DONE.
-    testkit/       cs-testkit     TestCluster harness, test plugins, transport
-                                  contract suite generic over TestTransport.
-  plugins/         (later)
-    cgroup/        cs-plugin-cgroup
-    gpu/           cs-plugin-gpu
-    selfmon/       cs-plugin-selfmon
+    testkit/       cs-testkit     TestCluster harness, misbehaving test plugins,
+                                  and the transport contract suite generic over
+                                  TestTransport. The one crate exempt from the
+                                  no-unwrap rule: a harness reports a broken
+                                  assumption by panicking. DONE.
+  plugins/
+    cgroup/        cs-plugin-cgroup  Per-job cgroup v2 sampler: cpu.stat,
+                                  memory.{current,peak,stat,events}, io.stat,
+                                  pids.current, PSI. Also `CgroupJobs`, the
+                                  `JobSource` an agent uses, and `FakeCgroups`
+                                  behind `test-util`. DONE.
+    selfmon/       cs-plugin-selfmon  The agent watching itself: engine counters,
+                                  this process's CPU/RSS from /proc/self, and
+                                  **CPU per thread name** — which is what the
+                                  `<service>/<worker>` convention was for. Plus
+                                  `FakeProc` behind `test-util`. DONE.
+    gpu/           cs-plugin-gpu      (later)
 apps/              (later)
   agent/           cs-agent       binary: registers samplers, picks transport
   server/          cs-server      binary: registers handlers, admin port
@@ -119,7 +135,10 @@ libfabric via FFI, progress thread bridged to async).
 ### Dependency rules (enforce in review)
 
 1. `crates/core/*` never depends on tokio or any runtime/transport crate.
-2. Plugins depend on `cs-api` only.
+2. Plugins depend on `cs-api` only — including their generated protobuf code,
+   which `prost_build::Config::prost_path("cs_api::prost")` points at cs-api's
+   re-export so the plugin needs no direct prost dependency. `JobSource` lives in
+   cs-api for the same reason: the crate that knows how to find jobs is a plugin.
 3. Transport impls depend on `cs-transport` (+ tokio), never on `cs-engine`.
 4. `cs-engine` depends on the `cs-transport` traits, never on an impl.
 5. Only `apps/*` and `cs-testkit` depend on concrete transports; each non-mock
@@ -194,8 +213,13 @@ pub trait Sampler: CommandReceiver + Send + 'static {
 // `FnMut() -> S` qualifies. Fallible construction belongs in Sampler::start.
 pub trait SamplerFactory: Send + 'static { type Sampler: Sampler; fn build(&mut self) -> Self::Sampler; }
 
+// `Origin` is not in the original sketch and has to be: a server that cannot tell
+// which node sent a batch cannot attribute anything — the entire point of this
+// project — nor address a command back to the sender.
+pub struct Origin<'a> { pub node: &'a str, pub service_version: u32 }
+
 pub trait Handler: ServiceBound + Send + Sync + 'static {
-    fn handle(&self, ctx: &ServiceCtx<Self::Service>, msg: Data<Self>)
+    fn handle(&self, ctx: &ServiceCtx<Self::Service>, from: Origin<'_>, msg: Data<Self>)
         -> impl Future<Output = Result<()>> + Send;
     fn shutdown(&self) -> impl Future<Output = ()> + Send { async {} }
 }
@@ -301,6 +325,12 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
 - Wire compatibility: fields are only added, never renumbered; every enum keeps
   `_UNSPECIFIED = 0`; `PROTOCOL_VERSION` in `Hello` is bumped only for a change
   an older peer cannot decode.
+- **A transport may return `Decode` only when it has consumed exactly one frame's
+  bytes and the stream is still framed.** The engine answers `Decode` by reading
+  the *next* frame, so a transport that has lost frame alignment must report
+  `Transport` and let the connection be rebuilt. In the TCP transport that is the
+  difference between a bad payload (`Decode`, skip it) and an untrustworthy length
+  prefix (`Transport`, reconnect).
 - `proto/frame.proto` is compiled by **protox**, not protoc, so building the
   workspace needs nothing but a Rust toolchain — no system protobuf on cluster
   build hosts. `bytes` fields decode as `Bytes` slices of the input buffer, so
@@ -358,6 +388,12 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
   worker threads join → `Handler::shutdown()` → `Goodbye` queued *behind*
   everything already there → writers drain and close → in-flight commands
   resolved.
+- **The deadline has to bound cleanup, not just the wait.** Aborting a service's
+  task does not stop the OS thread its `on_shutdown` is blocking on, so
+  `NamedWorker` *detaches* rather than joins on drop, and the plugin-worker join
+  is itself under the deadline. Joining either would let one plugin hold the
+  process open past the deadline that exists for exactly that reason; a detached
+  thread owns everything it touches and dies with the process.
 - **Service tasks and connection tasks are tracked in two separate `JoinSet`s**,
   and the order above is why: waiting for the connections before closing the
   queues deadlocks until the deadline (the writer cannot finish until the queue
@@ -378,11 +414,45 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
 - Send cumulative counters, not rates; server computes rates.
 - Sample every few seconds, batch and send every 30–60s.
 - Batches are columnar (one timestamp array, one value array per metric).
+- **An empty series means the metric is unavailable, never that it is zero.** A
+  fleet is not uniform: `memory.peak` needs Linux 5.19, PSI needs `CONFIG_PSI`,
+  `cpu.stat` reports throttling only once a limit is set. Flattening absent to
+  zero invents data that looks real.
+- Memory is a **gauge**, not a counter, and cannot be otherwise — which is why
+  `memory.peak` is carried alongside `memory.current`: it is the only memory
+  figure a sample gap cannot hide.
+- **Flush a job's partial batch the tick its cgroup disappears.** With a 45s
+  window, a job that ran for ten seconds would otherwise leave no record at all.
+  The sampler compares the engine's job list against what it is accumulating and
+  flushes what has gone *before* reading the rest.
+- A plugin reads the world through files, so test it with files. `FakeCgroups`
+  (feature `test-util`) builds a throwaway tree; mocking the filesystem would test
+  the mock.
+- A *missing* control file is ordinary (`Ok(None)`); a file that is **present and
+  in an unexpected format** is `ErrorKind::Decode` naming the file and line,
+  because reporting zero there would turn a wrong assumption about the kernel into
+  plausible-looking data.
 
 **Self-monitoring**
 - Engine keeps atomic counters (queue depths, frames/bytes, drops,
   reconnects, command RTT, per-service `sample()` timings) exposed read-only
   via `ServiceCtx::engine_stats()` and `EngineHandle::stats()`.
+- `cs-plugin-selfmon` reports them, and is **an ordinary plugin on purpose**: no
+  privileged hook, no special path into the engine. It is batched, chunked, queued
+  and dropped under pressure on the same terms as the metrics it reports on — a
+  shortcut would mean measuring a different system from the one running.
+- Thread CPU is summed **by name, not by tid**: a tid means nothing to a server.
+  The consequence is that a rebuilt service gets a fresh thread starting from zero,
+  so a thread's CPU can step *down* across a restart; `panics`/`restarts` in the
+  same batch say why.
+- `USER_HZ` is assumed to be 100 (`DEFAULT_USER_HZ`, overridable). Reading it
+  properly needs `sysconf(_SC_CLK_TCK)` and therefore libc, which rule 2 forbids a
+  plugin.
+- `/proc/<pid>/stat` **cannot be parsed by splitting on whitespace.** Field 2 is a
+  thread name in parentheses, and a thread name may contain spaces *and*
+  parentheses — so the parse starts at the **last** `)`. Getting this wrong yields
+  a plausible-looking wrong number rather than an error. There is a test with a
+  thread called `we (are) evil`.
 - Worker threads are named `<service>/<worker>` (≤15 chars, Linux limit) so
   per-plugin CPU can be read from `/proc/self/task/<tid>/{comm,stat}`.
   `cs_api::worker_thread_name` does the trimming — worker part first, service
@@ -474,9 +544,13 @@ transport** first, then run the **same suite** against TCP.
   - enforce its frame ceiling — `with_max_frame(n)`; an oversized frame fails to
     send, so an engine that forgets to chunk fails here, not in production
   - counters per direction — `frames_sent`, `frames_received`, `bytes_sent`
-- Clean close and broken close are **different** and the mock distinguishes them:
-  `FrameTx::close()` → peer reads `Ok(None)`; *dropping* a half without closing →
-  peer gets a retryable `Transport` error. Engine code must handle both.
+- The mock distinguishes a `close()` from a *dropped* half (the latter is a
+  retryable `Transport` error), which is useful for driving the engine's
+  broken-connection path — **but nothing may depend on that distinction.** TCP
+  sends a FIN either way, so the two are identical on the wire. Intent is carried
+  by `Goodbye`, not by the shape of a disconnect: an end of stream with no
+  `Goodbye` before it means the peer went away, and the engine reconnects. Engine
+  code must handle both shapes.
 - The mock serialises frames to bytes on the way through, so every test exercises
   encode/decode rather than passing Rust values around.
 - `cs-testkit` provides `TestCluster` (one server + N agents in one process,
@@ -484,7 +558,21 @@ transport** first, then run the **same suite** against TCP.
   loss/dup detection), echo with custom command, rejects-restart,
   panics-on-3rd-sample, slow-on_shutdown.
 - Transport contract suite is generic over a `TestTransport` trait; a new
-  transport is "done" when the suite passes.
+  transport is **done when the suite passes**. Invoke it with
+  `cs_testkit::transport_contract!(fixture)`, which generates one `#[tokio::test]`
+  per check. The fixture supplies endpoints (they are not portable between
+  transports) and declares which optional behaviours it can demonstrate —
+  `shows_backpressure` is false for TCP, whose kernel buffers absorb more than a
+  test wants to send, so that check is skipped rather than made meaningless.
+- **A contract check must never assume a buffer size.** Queueing N frames before
+  reading one asserts the buffer, not the ordering, and correctly deadlocks
+  against a transport that applies backpressure — which is what a hostile mock
+  does. Send and receive concurrently instead.
+- `cs-testkit`'s plugins are one configurable sampler
+  (`CounterConfig::panics_on_sample`, `fails_on_sample`, `refuses_restart`,
+  `refuses_shutdown`, `ignores_custom_commands`, `fails_to_start`,
+  `says_farewell`, `slow_to_shut_down`) rather than five near-identical ones,
+  because they differ only in which knob is set and would otherwise drift apart.
 - **Time**: all engine timing (TTLs, backoff, heartbeats, sampler intervals)
   goes through the `Clock` abstraction in `cs-async-util` so tests can run
   with a controlled clock (`#[tokio::test(start_paused = true)]` for async
@@ -500,11 +588,12 @@ transport** first, then run the **same suite** against TCP.
 2. ~~`cs-api` traits and types.~~ Done.
 3. ~~`cs-transport` traits + `Frame` + frame proto.~~ Done.
 4. ~~`cs-transport-mock`.~~ Done.
-5. ~~`cs-engine` against the mock.~~ Done — driven by test plugins living in
-   `crates/runtime/engine/tests/engine.rs` for now; extracting them into
-   `cs-testkit` with a `TestCluster` is what remains of this step.
-6. `cs-transport-tcp`; contract suite passes on both transports. ← next
-7. Plugins: cgroup, then selfmon, then gpu.
+5. ~~`cs-engine` against the mock, driven by `cs-testkit` test plugins.~~ Done.
+6. ~~`cs-transport-tcp`; contract suite passes on both transports.~~ Done — the
+   same 11 checks pass over the mock and over real sockets, plus an engine-level
+   run over TCP (`tests/engine_over_tcp.rs`) covering data, a command round trip,
+   and an agent surviving a server restart.
+7. Plugins: ~~cgroup~~, ~~selfmon~~, then gpu. ← gpu next
 8. Apps: agent, server, ctl.
 9. Later: gRPC transport, relay/aggregation tier, eBPF network plugin,
    RDMA transport.

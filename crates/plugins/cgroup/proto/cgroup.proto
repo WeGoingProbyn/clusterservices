@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+// Per-job cgroup v2 usage.
+//
+// Columnar, not one message per sample: a batch carries one timestamp array and
+// one array per metric. At a 3 second sample interval and a 45 second window that
+// is fifteen samples in one message instead of fifteen messages, and the repeated
+// job identity is paid for once.
+package cs.cgroup.v1;
+
+// One job step's samples over one batch window.
+message CgroupBatch {
+  // Which step these are for.
+  JobRef job = 1;
+
+  // When each sample was taken, milliseconds since the unix epoch.
+  //
+  // The length of this array is the length of the batch. Every series below has
+  // either exactly this many values, or **none at all** — an empty series means
+  // this kernel does not expose that metric, which is different from exposing a
+  // zero.
+  repeated uint64 sampled_unix_ms = 2;
+
+  // --- cpu.stat. Microseconds, cumulative since the cgroup was created.
+  repeated uint64 cpu_usage_usec = 10;
+  repeated uint64 cpu_user_usec = 11;
+  repeated uint64 cpu_system_usec = 12;
+  // Periods the scheduler accounted for, and how many of them hit the quota.
+  // The ratio is what tells an operator a job is being throttled rather than
+  // simply slow.
+  repeated uint64 cpu_nr_periods = 13;
+  repeated uint64 cpu_nr_throttled = 14;
+  repeated uint64 cpu_throttled_usec = 15;
+
+  // --- memory. Bytes.
+  //
+  // These are **gauges, not counters**: a reading, not a total. The convention
+  // elsewhere is cumulative counters, and memory simply does not work that way —
+  // which is why `memory_peak` matters, since it is the only one a sample gap
+  // cannot hide.
+  repeated uint64 memory_current = 20;
+  repeated uint64 memory_peak = 21;
+  // From memory.stat: anonymous and page-cache pages, so a job holding a large
+  // cache can be told from one holding a large heap.
+  repeated uint64 memory_anon = 22;
+  repeated uint64 memory_file = 23;
+  // From memory.events. Cumulative. `memory_max` counts times allocation was
+  // refused at the hard limit; `memory_oom_kill` counts processes actually killed.
+  repeated uint64 memory_max_events = 24;
+  repeated uint64 memory_oom_kill = 25;
+
+  // --- io.stat, summed across devices. Cumulative.
+  //
+  // Summed because per-device detail is rarely what a job owner asks about, and
+  // keeping it would make the batch size depend on how many disks a node has.
+  repeated uint64 io_rbytes = 30;
+  repeated uint64 io_wbytes = 31;
+  repeated uint64 io_rios = 32;
+  repeated uint64 io_wios = 33;
+
+  // --- pids.current. A gauge.
+  repeated uint64 pids_current = 40;
+
+  // --- Pressure stall information, microseconds, cumulative.
+  //
+  // `some` is time at least one task was stalled; `full` is time *every* task
+  // was. On a shared node `full` is the number that says a job was actually
+  // starved rather than merely contending.
+  repeated uint64 cpu_pressure_some_usec = 50;
+  repeated uint64 memory_pressure_some_usec = 51;
+  repeated uint64 memory_pressure_full_usec = 52;
+  repeated uint64 io_pressure_some_usec = 53;
+  repeated uint64 io_pressure_full_usec = 54;
+}
+
+// Which job step a batch describes.
+message JobRef {
+  // Slurm job id.
+  uint32 job_id = 1;
+  // The step, as it appears in the cgroup path without the `step_` prefix:
+  // `batch`, `extern`, `interactive`, or a number.
+  string step = 2;
+  // Owner of the job, so usage can be attributed to a user without a lookup.
+  uint32 uid = 3;
+}

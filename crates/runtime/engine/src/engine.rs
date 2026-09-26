@@ -8,8 +8,8 @@ use cs_api::runtime::{
     CommandKind as ApiCommandKind, CommandRequest, DataSink, ServiceRuntime, WorkerHost,
 };
 use cs_api::{
-    CommandOutcome, Encodable, EngineStats, Handler, Sampler, SamplerFactory, ServiceBound,
-    ServiceId,
+    CommandOutcome, Encodable, EngineStats, Handler, JobSource, NoJobs, Sampler, SamplerFactory,
+    ServiceBound, ServiceId,
 };
 use cs_async_util::{BoxFuture, Clock, CommandHandle, ShutdownSignal, command_channel};
 use cs_transport::{
@@ -28,8 +28,8 @@ use crate::peer::{
 };
 use crate::queue::PeerQueue;
 use crate::service::{
-    ErasedHandler, HandlerRegistration, JobSource, Jobs, NoJobs, SamplerRegistration, ServiceDeps,
-    ServiceHandle, register_handler, register_sampler,
+    ErasedHandler, HandlerRegistration, Jobs, SamplerRegistration, ServiceDeps, ServiceHandle,
+    register_handler, register_sampler,
 };
 use crate::stats::{Counters, SharedCounters};
 use crate::worker::{NamedWorker, Workers};
@@ -333,6 +333,7 @@ impl<T: Transport> EngineBuilder<T> {
 
         Ok(NodeEngine {
             transport: Arc::new(self.transport),
+            listening: Arc::new(Mutex::new(None)),
             config: Arc::clone(&config),
             clock: self.clock,
             job_source: self.job_source,
@@ -356,6 +357,7 @@ impl<T: Transport> EngineBuilder<T> {
 /// and never boxed, so the choice of transport costs nothing at run time.
 pub struct NodeEngine<T: Transport> {
     transport: Arc<T>,
+    listening: Arc<Mutex<Option<Endpoint>>>,
     config: Arc<EngineConfig>,
     clock: Arc<dyn Clock>,
     job_source: Arc<dyn JobSource>,
@@ -395,6 +397,7 @@ impl<T: Transport> NodeEngine<T> {
             shutdown: self.shutdown.clone(),
             stop: Arc::clone(&self.stop),
             counters: Arc::clone(&self.counters),
+            listening: Arc::clone(&self.listening),
         }
     }
 
@@ -493,11 +496,12 @@ impl<T: Transport> NodeEngine<T> {
                 .listen(&endpoint)
                 .await
                 .with_context(|| format!("listening on {endpoint}"))?;
-            info!(
-                endpoint = %listener.local_endpoint().unwrap_or(endpoint),
-                transport = self.capabilities.name,
-                "listening"
-            );
+            // Where we *actually* bound, which is not what was asked for when the
+            // request was port 0 — so record it where an operator, or a test, can
+            // see it.
+            let bound = listener.local_endpoint().unwrap_or(endpoint);
+            info!(endpoint = %bound, transport = self.capabilities.name, "listening");
+            *lock(&self.listening) = Some(bound);
             link_tasks.spawn(accept_loop(listener, Arc::clone(&inner), wiring.clone()));
         }
 
@@ -573,14 +577,25 @@ async fn shut_down(
     }
 
     // 2. The plugins' own worker threads, which may be blocked in a read.
+    //
+    //    Also under the deadline: a worker that ignores the shutdown signal must
+    //    not be able to stop the process from exiting. Abandoning a join handle
+    //    detaches the thread, which then dies with the process.
     let workers = Arc::clone(&inner.workers);
     let names = workers.names();
     if !names.is_empty() {
         debug!(?names, "joining plugin worker threads");
-        match tokio::task::spawn_blocking(move || workers.join_all()).await {
-            Ok(panicked) if !panicked.is_empty() => warn!(?panicked, "worker threads panicked"),
-            Ok(_) => {}
-            Err(err) => warn!(error = %err, "joining worker threads failed"),
+        let joining = tokio::task::spawn_blocking(move || workers.join_all());
+        tokio::select! {
+            biased;
+            joined = joining => match joined {
+                Ok(panicked) if !panicked.is_empty() => warn!(?panicked, "worker threads panicked"),
+                Ok(_) => {}
+                Err(err) => warn!(error = %err, "joining worker threads failed"),
+            },
+            () = clock.sleep_until(deadline) => {
+                warn!(?names, "deadline reached; abandoning plugin worker threads");
+            }
         }
     }
 
@@ -652,6 +667,7 @@ pub struct EngineHandle {
     shutdown: ShutdownSignal,
     stop: Arc<StopRequest>,
     counters: SharedCounters,
+    listening: Arc<Mutex<Option<Endpoint>>>,
 }
 
 impl EngineHandle {
@@ -677,6 +693,16 @@ impl EngineHandle {
     #[must_use]
     pub fn stats(&self) -> EngineStats {
         self.counters.snapshot()
+    }
+
+    /// Where this engine is listening, once it is.
+    ///
+    /// `None` before the listener binds, and for an engine that only dials. Not
+    /// necessarily the endpoint it was given: an engine told to listen on port 0
+    /// learns its real port only from here.
+    #[must_use]
+    pub fn listening(&self) -> Option<Endpoint> {
+        lock(&self.listening).clone()
     }
 }
 

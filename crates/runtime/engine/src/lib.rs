@@ -57,4 +57,7 @@ mod worker;
 pub use config::{Backoff, EngineConfig};
 pub use engine::{EngineBuilder, EngineHandle, NodeEngine, TokioClock};
 pub use peer::Stop;
-pub use service::{JobSource, NoJobs};
+// Re-exported for convenience: an engine is configured with one of these, but the
+// trait lives in cs-api so a plugin can implement it without depending on the
+// engine.
+pub use cs_api::{JobSource, NoJobs};

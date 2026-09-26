@@ -1,347 +1,55 @@
 //! The engine, end to end, over the hostile mock transport.
 //!
-//! These drive the public API only — build an engine, register plugins, run it —
-//! so they exercise the same path an agent and a server will.
+//! Driven entirely through `cs-testkit`: the plugins, the cluster, and the waiting
+//! all come from there, so these tests say what the engine should *do* and nothing
+//! about how to set one up.
 
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cs_api::{
-    CommandOpts, CommandOutcome, CommandReceiver, Handler, JobInfo, NoCommand, Reply, Sampler,
-    ServiceBound, ServiceCtx, ServiceDef,
+use cs_api::{Command, CommandOpts, CommandOutcome};
+use cs_engine::{EngineConfig, NodeEngine, Stop};
+use cs_testkit::{
+    BulkSampler, BulkService, Collect, Commander, CounterConfig, CounterService, TestCluster,
 };
-use cs_engine::{EngineConfig, EngineHandle, NodeEngine, Stop};
 use cs_transport_mock::{Direction, MockNetwork};
-use cs_util::{Error, ErrorKind, Result};
+use cs_util::ErrorKind;
 
-// --- the service under test ---------------------------------------------------
+/// A cluster with one well-behaved agent and a recording server.
+async fn simple() -> (TestCluster, Collect<CounterService>, CounterConfig) {
+    let collected = Collect::<CounterService>::new();
+    let counter = CounterConfig::new();
 
-/// Counters, with a command to retune the interval.
-struct Counter;
+    let cluster = TestCluster::builder()
+        .server({
+            let collected = collected.clone();
+            move |server| server.handler(collected)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
 
-impl ServiceDef for Counter {
-    const NAME: &'static str = "counter";
-    const VERSION: u32 = 2;
-    /// Sequence numbers, so a test can detect loss, duplication, and reordering.
-    type Data = u64;
-    /// A new interval, in milliseconds.
-    type Command = u64;
+    (cluster, collected, counter)
 }
 
-/// A sampler that emits consecutive numbers.
-struct CountSampler {
-    next: u64,
-    interval: Duration,
-    /// Panics on this sample, to exercise supervision. `None` never panics.
-    panic_on: Option<u64>,
-    /// Refuses `Restart`, to exercise the rejection path.
-    refuse_restart: bool,
-    /// What `on_shutdown` emits.
-    farewell: Option<u64>,
-    /// Shared so a test can see how many times the factory was called.
-    builds: Arc<AtomicU32>,
-}
-
-#[derive(Clone, Default)]
-struct CounterSetup {
-    panic_on: Option<u64>,
-    refuse_restart: bool,
-    farewell: Option<u64>,
-    interval: Option<Duration>,
-    builds: Arc<AtomicU32>,
-}
-
-impl CounterSetup {
-    /// A factory, as the engine wants it.
-    fn factory(&self) -> impl FnMut() -> CountSampler + Send + 'static {
-        let setup = self.clone();
-        move || {
-            setup.builds.fetch_add(1, Ordering::SeqCst);
-            CountSampler {
-                next: 0,
-                interval: setup.interval.unwrap_or(Duration::from_millis(5)),
-                panic_on: setup.panic_on,
-                refuse_restart: setup.refuse_restart,
-                farewell: setup.farewell,
-                builds: Arc::clone(&setup.builds),
-            }
-        }
-    }
-
-    fn builds(&self) -> u32 {
-        self.builds.load(Ordering::SeqCst)
-    }
-}
-
-impl ServiceBound for CountSampler {
-    type Service = Counter;
-}
-
-impl CommandReceiver for CountSampler {
-    fn on_command(&mut self, command: cs_api::Command<u64>) -> Reply {
-        match command {
-            cs_api::Command::Custom(millis) => {
-                self.interval = Duration::from_millis(millis);
-                Reply::Handled
-            }
-            cs_api::Command::Restart if self.refuse_restart => Reply::rejected("mid-batch"),
-            _ => Reply::Default,
-        }
-    }
-}
-
-impl Sampler for CountSampler {
-    fn interval(&self) -> Duration {
-        self.interval
-    }
-
-    fn sample(&mut self, _jobs: &[JobInfo]) -> Result<Vec<u64>> {
-        self.next += 1;
-        if self.panic_on == Some(self.next) {
-            panic!("sampler exploded on sample {}", self.next);
-        }
-        Ok(vec![self.next])
-    }
-
-    fn on_shutdown(&mut self, _jobs: &[JobInfo]) -> Result<Vec<u64>> {
-        let _ = &self.builds;
-        Ok(self.farewell.into_iter().collect())
-    }
-}
-
-/// A sampler that refuses to start, for the "NVML is absent" case.
-struct Unstartable;
-
-impl ServiceBound for Unstartable {
-    type Service = Counter;
-}
-impl CommandReceiver for Unstartable {}
-
-impl Sampler for Unstartable {
-    fn interval(&self) -> Duration {
-        Duration::from_millis(5)
-    }
-
-    fn sample(&mut self, _jobs: &[JobInfo]) -> Result<Vec<u64>> {
-        Ok(Vec::new())
-    }
-
-    fn start(&mut self, _ctx: &ServiceCtx<Counter>) -> Result<()> {
-        Err(Error::new(ErrorKind::Plugin, "this node has no hardware"))
-    }
-}
-
-/// A service whose payloads are big enough to need chunking.
-struct Bulk;
-
-impl ServiceDef for Bulk {
-    const NAME: &'static str = "bulk";
-    type Data = String;
-    type Command = NoCommand;
-}
-
-struct BulkSampler {
-    size: usize,
-    sent: bool,
-}
-
-impl ServiceBound for BulkSampler {
-    type Service = Bulk;
-}
-impl CommandReceiver for BulkSampler {}
-
-impl Sampler for BulkSampler {
-    fn interval(&self) -> Duration {
-        Duration::from_millis(5)
-    }
-
-    fn sample(&mut self, _jobs: &[JobInfo]) -> Result<Vec<String>> {
-        if self.sent {
-            return Ok(Vec::new());
-        }
-        self.sent = true;
-        Ok(vec!["x".repeat(self.size)])
-    }
-}
-
-// --- handlers -----------------------------------------------------------------
-
-/// Records everything it is given.
-#[derive(Clone, Default)]
-struct Collect<T> {
-    seen: Arc<Mutex<Vec<T>>>,
-    closed: Arc<AtomicU32>,
-}
-
-impl<T> Collect<T> {
-    fn seen(&self) -> Vec<T>
-    where
-        T: Clone,
-    {
-        self.seen.lock().unwrap_or_else(|p| p.into_inner()).clone()
-    }
-}
-
-impl ServiceBound for Collect<u64> {
-    type Service = Counter;
-}
-
-impl Handler for Collect<u64> {
-    async fn handle(&self, _ctx: &ServiceCtx<Counter>, message: u64) -> Result<()> {
-        self.seen
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(message);
-        Ok(())
-    }
-
-    async fn shutdown(&self) {
-        self.closed.fetch_add(1, Ordering::SeqCst);
-    }
-}
-
-impl ServiceBound for Collect<String> {
-    type Service = Bulk;
-}
-
-impl Handler for Collect<String> {
-    async fn handle(&self, _ctx: &ServiceCtx<Bulk>, message: String) -> Result<()> {
-        self.seen
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(message);
-        Ok(())
-    }
-}
-
-/// Sends a command back to the node that just sent it data — the loop a real
-/// server closes when it decides a sampler is too chatty.
-struct Commander {
-    seen: Arc<AtomicU64>,
-    outcome: Arc<Mutex<Option<std::result::Result<CommandOutcome, String>>>>,
-    interval_ms: u64,
-}
-
-impl ServiceBound for Commander {
-    type Service = Counter;
-}
-
-impl Handler for Commander {
-    async fn handle(&self, ctx: &ServiceCtx<Counter>, message: u64) -> Result<()> {
-        if self.seen.fetch_add(1, Ordering::SeqCst) > 0 {
-            return Ok(());
-        }
-        let _ = message;
-        let answer = ctx
-            .command::<Counter>(
-                "node-1",
-                cs_api::Command::Custom(self.interval_ms),
-                CommandOpts::default(),
-            )
-            .await;
-        *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) =
-            Some(answer.map_err(|err| format!("{err:?}")));
-        Ok(())
-    }
-}
-
-// --- harness ------------------------------------------------------------------
-
-/// Wait for `condition`, or fail the test.
-async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while std::time::Instant::now() < deadline {
-        if condition() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-fn config(node: &str) -> EngineConfig {
-    EngineConfig {
-        // Short enough that tests do not wait, long enough to be deterministic.
-        heartbeat_interval: Duration::from_millis(50),
-        job_refresh: Duration::from_millis(20),
-        shutdown_deadline: Duration::from_secs(5),
-        reconnect: cs_engine::Backoff {
-            initial: Duration::from_millis(5),
-            max: Duration::from_millis(20),
-            factor: 2,
-        },
-        restart_backoff: cs_engine::Backoff {
-            initial: Duration::from_millis(5),
-            max: Duration::from_millis(20),
-            factor: 2,
-        },
-        ..EngineConfig::new(node)
-    }
-}
-
-/// A running engine and the handle that stops it.
-struct Running {
-    handle: EngineHandle,
-    task: tokio::task::JoinHandle<Result<Stop>>,
-}
-
-impl Running {
-    #[allow(clippy::expect_used, reason = "a test harness should fail loudly")]
-    async fn stop(self) -> Stop {
-        self.handle.shutdown();
-        self.task.await.expect("engine task").expect("clean stop")
-    }
-
-    #[allow(clippy::expect_used, reason = "a test harness should fail loudly")]
-    async fn finish(self) -> Stop {
-        self.task.await.expect("engine task").expect("clean stop")
-    }
-}
-
-fn start<T: cs_transport::Transport>(engine: NodeEngine<T>) -> Running {
-    let handle = engine.handle();
-    Running {
-        handle,
-        task: tokio::spawn(engine.run()),
-    }
-}
-
-// --- tests --------------------------------------------------------------------
+// --- the data path ------------------------------------------------------------
 
 #[tokio::test]
 async fn data_flows_from_a_sampler_to_a_handler_on_another_engine() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
-
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(CounterSetup::default().factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
-
-    wait_for("the first batches to arrive", || {
-        collected.seen().len() >= 3
-    })
-    .await;
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("the first batches", || collected.count() >= 3)
+        .await;
 
     // Sequence numbers, in order, with nothing lost or repeated.
     let seen = collected.seen();
     assert_eq!(seen[..3], [1, 2, 3], "got {seen:?}");
+    // And every one is attributed to the node that sent it.
+    assert!(collected.senders().iter().all(|node| node == "node-1"));
 
-    let stats = agent.handle.stats();
+    let stats = cluster.agent().stats();
     assert!(stats.connected);
     assert_eq!(stats.peers, 1);
     let counter = stats.service("counter").expect("the service is listed");
@@ -349,379 +57,399 @@ async fn data_flows_from_a_sampler_to_a_handler_on_another_engine() {
     assert_eq!(counter.sample_errors, 0);
     assert_eq!(counter.panics, 0);
 
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn several_agents_are_kept_apart() {
+    let collected = Collect::<CounterService>::new();
+    let counter = CounterConfig::new();
+
+    let cluster = TestCluster::builder()
+        .server({
+            let collected = collected.clone();
+            move |server| server.handler(collected)
+        })
+        .agents(3, {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("all three agents", || {
+            cluster.server().expect("server").stats().peers == 3
+        })
+        .await;
+    cluster
+        .wait_for("data from every agent", || {
+            let senders = collected.senders();
+            ["node-1", "node-2", "node-3"]
+                .iter()
+                .all(|node| senders.iter().any(|seen| seen == node))
+        })
+        .await;
+
+    cluster.stop().await;
 }
 
 #[tokio::test]
 async fn a_message_too_big_for_one_frame_is_chunked_and_reassembled() {
-    // Small enough that a 40 KiB message needs many frames.
-    let network = MockNetwork::new().with_max_frame(512);
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<String>::default();
+    let collected = Collect::<BulkService>::new();
     let size = 40 * 1024;
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(move || BulkSampler { size, sent: false })
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
+    let cluster = TestCluster::builder()
+        // Small enough that 40 KiB needs many frames.
+        .max_frame(512)
+        .server({
+            let collected = collected.clone();
+            move |server| server.handler(collected)
+        })
+        .agent("node-1", move |agent| {
+            agent.sampler(BulkSampler::factory(size))
+        })
+        .start()
+        .await;
 
-    wait_for("the chunked message", || !collected.seen().is_empty()).await;
+    cluster
+        .wait_for("the chunked message", || collected.count() >= 1)
+        .await;
     let seen = collected.seen();
     assert_eq!(
         seen[0].len(),
         size,
         "the message came back a different size"
     );
-    assert!(seen[0].bytes().all(|b| b == b'x'));
+    assert!(seen[0].bytes().all(|byte| byte == b'x'));
 
-    // It really was split: far more frames than messages.
-    let link = network.last_link().expect("a link");
+    // It really was split, rather than squeezed through whole.
+    let sent = cluster.link().frames_sent(Direction::ToServer);
     assert!(
-        link.frames_sent(Direction::ToServer) > 50,
-        "only {} frames for {size} bytes over 512-byte frames",
-        link.frames_sent(Direction::ToServer)
+        sent > 50,
+        "only {sent} frames for {size} bytes over 512-byte frames"
     );
 
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
 }
 
+// --- commands -----------------------------------------------------------------
+
 #[tokio::test]
-async fn a_server_handler_can_command_the_node_that_sent_it_data() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let outcome = Arc::new(Mutex::new(None));
-    let commander = Commander {
-        seen: Arc::new(AtomicU64::new(0)),
-        outcome: Arc::clone(&outcome),
-        interval_ms: 7,
-    };
+async fn a_handler_can_command_the_node_that_sent_it_data() {
+    let commander = Commander::new(Command::Custom(7));
+    let counter = CounterConfig::new();
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(commander)
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(CounterSetup::default().factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
+    let cluster = TestCluster::builder()
+        .server({
+            let commander = commander.clone();
+            move |server| server.handler(commander)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
 
-    wait_for("the command to be answered", || {
-        outcome.lock().unwrap_or_else(|p| p.into_inner()).is_some()
-    })
-    .await;
+    cluster
+        .wait_for("the command to be answered", || {
+            commander.outcome().is_some()
+        })
+        .await;
 
-    let answered = outcome
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
-        .expect("an answer");
-    // The sampler said `Handled`, which is `Ok` to the operator.
-    assert_eq!(answered, Ok(CommandOutcome::Ok));
-
-    let stats = server.handle.stats();
+    // The sampler answered `Handled`, which is `Ok` to whoever asked.
+    assert_eq!(commander.outcome(), Some(Ok(CommandOutcome::Ok)));
+    let stats = cluster.server().expect("server").stats();
     assert_eq!(stats.commands_completed, 1);
     assert_eq!(stats.commands_expired, 0);
 
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
 }
 
 #[tokio::test]
-async fn a_rejected_restart_leaves_the_service_running_and_says_why() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
-    let setup = CounterSetup {
-        refuse_restart: true,
-        ..CounterSetup::default()
-    };
+async fn a_custom_command_nobody_implements_comes_back_unsupported() {
+    let commander = Commander::new(Command::Custom(7));
+    let counter = CounterConfig::new().ignores_custom_commands();
 
-    let server_engine = NodeEngine::builder(network.transport())
-        .config(config("head01"))
-        .handler(collected.clone())
-        .listen(at.clone())
-        .build()
-        .expect("server");
-    let server = start(server_engine);
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(setup.factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
+    let cluster = TestCluster::builder()
+        .server({
+            let commander = commander.clone();
+            move |server| server.handler(commander)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("an answer", || commander.outcome().is_some())
+        .await;
+    assert_eq!(
+        commander.outcome(),
+        Some(Ok(CommandOutcome::Unsupported)),
+        "a service that ignores a command must not report success"
     );
 
-    wait_for("the agent to connect", || {
-        server.handle.stats().peers == 1 && !collected.seen().is_empty()
-    })
-    .await;
-
-    // There is no public command API on the handle, so the command goes through a
-    // handler's context — which is the path an operator's request takes anyway.
-    // Here we assert the sampler kept running and was never rebuilt.
-    let before = setup.builds();
-    wait_for("more samples", || collected.seen().len() > 3).await;
-    assert_eq!(setup.builds(), before, "the sampler should not be rebuilt");
-
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
 }
+
+#[tokio::test]
+async fn a_refused_restart_leaves_the_service_running_and_says_why() {
+    let commander = Commander::new(Command::Restart);
+    let counter = CounterConfig::new().refuses_restart();
+
+    let cluster = TestCluster::builder()
+        .server({
+            let commander = commander.clone();
+            move |server| server.handler(commander)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the refusal", || commander.outcome().is_some())
+        .await;
+    assert_eq!(
+        commander.outcome(),
+        Some(Ok(CommandOutcome::Rejected("mid-batch".into()))),
+        "the reason must reach the operator"
+    );
+
+    // And the service was neither stopped nor rebuilt.
+    let built_once = counter.builds();
+    let samples = counter.samples();
+    cluster
+        .wait_for("more samples", || counter.samples() > samples + 2)
+        .await;
+    assert_eq!(counter.builds(), built_once, "it should not be rebuilt");
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn a_command_for_a_node_that_is_not_connected_expires() {
+    let commander = Commander::new(Command::Restart)
+        .addressed_to("node-that-does-not-exist")
+        .with_opts(CommandOpts::expiring_in(Duration::from_millis(50)));
+    let counter = CounterConfig::new();
+
+    let cluster = TestCluster::builder()
+        .server({
+            let commander = commander.clone();
+            move |server| server.handler(commander)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the command to expire", || commander.outcome().is_some())
+        .await;
+    assert_eq!(
+        commander.outcome(),
+        Some(Ok(CommandOutcome::Expired)),
+        "a command for an absent node must resolve, not hang"
+    );
+    assert_eq!(
+        cluster.server().expect("server").stats().commands_expired,
+        1
+    );
+
+    cluster.stop().await;
+}
+
+// --- supervision --------------------------------------------------------------
 
 #[tokio::test]
 async fn a_panicking_sampler_is_rebuilt_and_keeps_reporting() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
-    let setup = CounterSetup {
-        panic_on: Some(3),
-        ..CounterSetup::default()
-    };
+    let collected = Collect::<CounterService>::new();
+    let counter = CounterConfig::new().panics_on_sample(3);
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
+    let cluster = TestCluster::builder()
+        .server({
+            let collected = collected.clone();
+            move |server| server.handler(collected)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    // It panics on its third sample, is rebuilt, and counts again from one — so a
+    // repeated `1` is the proof that a fresh instance took over.
+    cluster
+        .wait_for("a rebuild", || counter.builds() >= 2)
+        .await;
+    cluster
+        .wait_for("samples after the rebuild", || {
+            collected.seen().iter().filter(|&&n| n == 1).count() >= 2
+        })
+        .await;
+
+    let stats = cluster.agent().stats();
+    assert!(
+        stats.service("counter").expect("counter").panics >= 1,
+        "the panic should be counted"
     );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(setup.factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
 
-    // It panics on its third sample, is rebuilt, and starts counting again — so
-    // the sequence restarts rather than stopping.
-    wait_for("a rebuild", || setup.builds() >= 2).await;
-    wait_for("samples after the rebuild", || {
-        let seen = collected.seen();
-        seen.iter().filter(|&&n| n == 1).count() >= 2
-    })
-    .await;
+    cluster.stop().await;
+}
 
-    let stats = agent.handle.stats();
-    let counter = stats.service("counter").expect("counter");
-    assert!(counter.panics >= 1, "the panic should be counted");
+#[tokio::test]
+async fn a_failing_sample_is_counted_but_does_not_rebuild_anything() {
+    let collected = Collect::<CounterService>::new();
+    let counter = CounterConfig::new().fails_on_sample(2);
 
-    agent.stop().await;
-    server.stop().await;
+    let cluster = TestCluster::builder()
+        .server({
+            let collected = collected.clone();
+            move |server| server.handler(collected)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("samples either side of the failure", || {
+            counter.samples() >= 4
+        })
+        .await;
+
+    let stats = cluster.agent().stats();
+    let service = stats.service("counter").expect("counter");
+    assert_eq!(service.sample_errors, 1, "the failure should be counted");
+    assert_eq!(service.panics, 0, "an error is not a panic");
+    assert_eq!(counter.builds(), 1, "an error must not rebuild the sampler");
+    // The samples either side of the failure still arrived.
+    assert!(collected.seen().contains(&1));
+    assert!(collected.seen().contains(&3));
+
+    cluster.stop().await;
 }
 
 #[tokio::test]
 async fn a_sampler_that_refuses_to_start_stops_without_taking_the_engine_down() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
+    let counter = CounterConfig::new().fails_to_start();
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(Collect::<u64>::default())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(|| Unstartable)
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
+    let cluster = TestCluster::builder()
+        .server(|server| server.handler(Collect::<CounterService>::new()))
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
 
     // The engine still connects and stays up; only the service is gone.
-    wait_for("the agent to connect anyway", || {
-        server.handle.stats().peers == 1
-    })
-    .await;
-    assert!(!agent.handle.is_stopping());
+    cluster
+        .wait_for("the agent to connect anyway", || {
+            cluster.server().expect("server").stats().peers == 1
+        })
+        .await;
+    assert!(!cluster.agent().handle().is_stopping());
+    assert_eq!(counter.builds(), 1, "a refusal to start is not retried");
 
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
 }
+
+// --- outages ------------------------------------------------------------------
 
 #[tokio::test]
 async fn data_produced_during_an_outage_is_delivered_on_reconnect() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
-
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(CounterSetup::default().factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
-
-    wait_for("the first batches", || collected.seen().len() >= 2).await;
-    let before_outage = collected.seen().len();
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("the first batches", || collected.count() >= 2)
+        .await;
+    let before_outage = collected.count();
 
     // Break the link. The sampler carries on filling the buffer.
-    network.last_link().expect("a link").kill();
-    wait_for("a reconnect", || network.link_count() >= 2).await;
-    wait_for("data after the reconnect", || {
-        collected.seen().len() > before_outage + 2
-    })
-    .await;
+    cluster.link().kill();
+    cluster
+        .wait_for("a reconnect", || cluster.network().link_count() >= 2)
+        .await;
+    cluster
+        .wait_for("data after the reconnect", || {
+            collected.count() > before_outage + 2
+        })
+        .await;
 
-    // Nothing was lost across the gap: the sequence continues.
+    // Nothing went backwards across the gap: the sequence kept climbing.
     let seen = collected.seen();
     let highest = seen.iter().copied().max().expect("some data");
     assert!(
         highest as usize >= before_outage,
         "the sequence went backwards: {seen:?}"
     );
-    assert!(agent.handle.stats().reconnects >= 1);
+    assert!(cluster.agent().stats().reconnects >= 1);
 
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
 }
 
 #[tokio::test]
 async fn an_agent_keeps_dialling_until_the_server_appears() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
+    let collected = Collect::<CounterService>::new();
+    let counter = CounterConfig::new();
 
-    // The agent starts first, with nothing to connect to.
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(CounterSetup::default().factory())
-            .dial(at.clone())
-            .build()
-            .expect("agent"),
-    );
-    wait_for("some failed attempts", || {
-        network.connect_attempts("server") >= 3
-    })
-    .await;
-    assert!(!agent.handle.stats().connected);
+    // No server at all to begin with.
+    let cluster = TestCluster::builder()
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
 
-    // Now bring the server up; the agent finds it without being told.
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at)
-            .build()
-            .expect("server"),
-    );
-    wait_for("data once the server exists", || {
-        !collected.seen().is_empty()
-    })
-    .await;
+    cluster
+        .wait_for("some failed attempts", || {
+            cluster.network().connect_attempts(cs_testkit::SERVER) >= 3
+        })
+        .await;
+    assert!(!cluster.agent().stats().connected);
 
-    agent.stop().await;
-    server.stop().await;
-}
+    // Bring a server up on the same network; the agent finds it unprompted.
+    let server = NodeEngine::builder(cluster.network().transport())
+        .config(EngineConfig::new("head01"))
+        .handler(collected.clone())
+        .listen(TestCluster::server_endpoint())
+        .build()
+        .expect("server");
+    let server_handle = server.handle();
+    let server_task = tokio::spawn(server.run());
 
-#[tokio::test]
-async fn on_shutdown_data_is_flushed_before_the_connection_closes() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
-    let farewell = 999_999;
-    let setup = CounterSetup {
-        farewell: Some(farewell),
-        interval: Some(Duration::from_millis(50)),
-        ..CounterSetup::default()
-    };
+    cluster
+        .wait_for("data once the server exists", || collected.count() >= 1)
+        .await;
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(setup.factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
-
-    wait_for("the agent to connect", || server.handle.stats().peers == 1).await;
-
-    assert_eq!(agent.stop().await, Stop::Shutdown);
-    wait_for("the farewell batch", || {
-        collected.seen().contains(&farewell)
-    })
-    .await;
-
-    server.stop().await;
+    cluster.stop().await;
+    server_handle.shutdown();
+    server_task.await.expect("task").expect("clean stop");
 }
 
 #[tokio::test]
 async fn garbage_on_the_wire_is_survived_rather_than_fatal() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("a connection and some data", || collected.count() >= 1)
+        .await;
+    let link = cluster.link();
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(CounterSetup::default().factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
-
-    wait_for("a connection", || network.link_count() >= 1).await;
-    let link = network.last_link().expect("a link");
-    wait_for("some data", || !collected.seen().is_empty()).await;
-
-    // Something that is not a frame at all, then something that is a frame but
-    // nobody's business.
+    // Something that is not a frame at all, then a frame for a service nobody
+    // handles.
     link.inject_garbage(Direction::ToServer).expect("inject");
     let stray = cs_transport::Frame::Data(cs_transport::DataFrame::new(
         "nosuchservice",
@@ -731,80 +459,179 @@ async fn garbage_on_the_wire_is_survived_rather_than_fatal() {
     .encode();
     link.inject(Direction::ToServer, stray).expect("inject");
 
-    // The link survives both, and data keeps flowing on it.
-    let before = collected.seen().len();
-    wait_for("data after the garbage", || {
-        collected.seen().len() > before + 2
-    })
-    .await;
+    // The connection survives both, and data keeps flowing on it.
+    let before = collected.count();
+    cluster
+        .wait_for("data after the garbage", || collected.count() > before + 2)
+        .await;
     assert!(link.is_alive(), "the connection should have survived");
-    assert_eq!(network.link_count(), 1, "and not been re-established");
-
-    let stats = server.handle.stats();
+    assert_eq!(
+        cluster.network().link_count(),
+        1,
+        "and should not have been re-established"
+    );
     assert!(
-        stats.unroutable_frames >= 2,
-        "both should be counted, got {}",
-        stats.unroutable_frames
+        cluster.server().expect("server").stats().unroutable_frames >= 2,
+        "both should be counted"
     );
 
-    agent.stop().await;
-    server.stop().await;
+    cluster.stop().await;
 }
 
 #[tokio::test]
-async fn a_server_shutdown_tells_its_agents_and_closes_its_handlers() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
-    let collected = Collect::<u64>::default();
-    let closed = Arc::clone(&collected.closed);
+async fn a_handler_that_always_fails_does_not_cost_the_connection() {
+    let failing = Collect::<CounterService>::failing();
+    let counter = CounterConfig::new();
 
-    let server = start(
-        NodeEngine::builder(network.transport())
-            .config(config("head01"))
-            .handler(collected.clone())
-            .listen(at.clone())
-            .build()
-            .expect("server"),
-    );
-    let agent = start(
-        NodeEngine::builder(network.transport())
-            .config(config("node-1"))
-            .sampler(CounterSetup::default().factory())
-            .dial(at)
-            .build()
-            .expect("agent"),
-    );
-    wait_for("a connection", || server.handle.stats().peers == 1).await;
+    let cluster = TestCluster::builder()
+        .server({
+            let failing = failing.clone();
+            move |server| server.handler(failing)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
 
-    server.stop().await;
-    assert_eq!(closed.load(Ordering::SeqCst), 1, "Handler::shutdown ran");
+    cluster
+        .wait_for("several rejected messages", || {
+            cluster
+                .server()
+                .expect("server")
+                .stats()
+                .service("counter")
+                .is_some_and(|service| service.messages_received >= 3)
+        })
+        .await;
+    assert_eq!(failing.count(), 0, "it rejected everything");
+    assert_eq!(cluster.network().live_link_count(), 1, "still connected");
 
-    // The agent notices and starts dialling again rather than giving up.
-    wait_for("the agent to try again", || {
-        network.connect_attempts("server") >= 2
-    })
-    .await;
+    cluster.stop().await;
+}
+
+// --- shutdown -----------------------------------------------------------------
+
+#[tokio::test]
+async fn on_shutdown_data_is_flushed_before_the_connection_closes() {
+    let collected = Collect::<CounterService>::new();
+    let farewell = 999_999;
+    // Slow enough that the farewell cannot be mistaken for an ordinary sample.
+    let counter = CounterConfig::new()
+        .every(Duration::from_millis(50))
+        .says_farewell(farewell);
+
+    let mut cluster = TestCluster::builder()
+        .server({
+            let collected = collected.clone();
+            move |server| server.handler(collected)
+        })
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the agent to connect", || {
+            cluster.server().expect("server").stats().peers == 1
+        })
+        .await;
+
+    // Stopping the agent must get the final flush out ahead of the goodbye.
+    let agent = cluster.take_agent();
+    assert_eq!(agent.stop().await, Stop::Shutdown);
+    cluster
+        .wait_for("the farewell batch", || {
+            collected.seen().contains(&farewell)
+        })
+        .await;
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn a_slow_flush_does_not_hang_shutdown_past_its_deadline() {
+    let counter = CounterConfig::new()
+        // Far longer than the deadline below, so the engine must give up on it.
+        .slow_to_shut_down(Duration::from_secs(30))
+        .says_farewell(1);
+
+    let mut cluster = TestCluster::builder()
+        .server(|server| server.handler(Collect::<CounterService>::new()))
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| {
+                agent
+                    .config(EngineConfig {
+                        shutdown_deadline: Duration::from_millis(200),
+                        ..cs_testkit::test_config("node-1")
+                    })
+                    .sampler(counter.factory())
+            }
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the agent to be sampling", || counter.samples() >= 1)
+        .await;
+
+    let agent = cluster.take_agent();
+    let began = std::time::Instant::now();
     agent.stop().await;
+    let took = began.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "shutdown took {took:?}; the deadline should have cut it short"
+    );
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn a_server_shutdown_tells_its_agents_to_come_back() {
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("a connection", || {
+            cluster.server().expect("server").stats().peers == 1
+        })
+        .await;
+
+    let mut cluster = cluster;
+    let server = cluster.take_server();
+    server.stop().await;
+    assert_eq!(
+        collected.shutdowns(),
+        1,
+        "Handler::shutdown should have run"
+    );
+
+    // The agent is told `restart`, so it keeps dialling rather than giving up.
+    cluster
+        .wait_for("the agent to try again", || {
+            cluster.network().connect_attempts(cs_testkit::SERVER) >= 2
+        })
+        .await;
+
+    cluster.stop().await;
 }
 
 #[tokio::test]
 async fn restarting_reports_the_reason_the_supervisor_needs() {
-    let network = MockNetwork::new();
-    let at = MockNetwork::endpoint("server");
+    let counter = CounterConfig::new();
+    let mut cluster = TestCluster::builder()
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
 
-    let agent_engine = NodeEngine::builder(network.transport())
-        .config(config("node-1"))
-        .sampler(CounterSetup::default().factory())
-        .dial(at)
-        .build()
-        .expect("agent");
-    let handle = agent_engine.handle();
-    let agent = Running {
-        handle: handle.clone(),
-        task: tokio::spawn(agent_engine.run()),
-    };
-
-    handle.restart();
+    let agent = cluster.take_agent();
+    agent.handle().restart();
     assert_eq!(
         agent.finish().await,
         Stop::Restart,
@@ -816,9 +643,8 @@ async fn restarting_reports_the_reason_the_supervisor_needs() {
 
 #[test]
 fn an_engine_with_no_endpoints_is_rejected() {
-    let network = MockNetwork::new();
-    let err = NodeEngine::builder(network.transport())
-        .config(config("node-1"))
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .config(EngineConfig::new("node-1"))
         .build()
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Config);
@@ -827,11 +653,10 @@ fn an_engine_with_no_endpoints_is_rejected() {
 
 #[test]
 fn a_sampler_with_nowhere_to_send_is_rejected() {
-    let network = MockNetwork::new();
-    let err = NodeEngine::builder(network.transport())
-        .config(config("node-1"))
-        .sampler(CounterSetup::default().factory())
-        .listen(MockNetwork::endpoint("server"))
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .config(EngineConfig::new("node-1"))
+        .sampler(CounterConfig::new().factory())
+        .listen(TestCluster::server_endpoint())
         .build()
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Config);
@@ -840,12 +665,11 @@ fn a_sampler_with_nowhere_to_send_is_rejected() {
 
 #[test]
 fn two_services_with_one_name_are_rejected() {
-    let network = MockNetwork::new();
-    let err = NodeEngine::builder(network.transport())
-        .config(config("head01"))
-        .handler(Collect::<u64>::default())
-        .handler(Collect::<u64>::default())
-        .listen(MockNetwork::endpoint("server"))
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .config(EngineConfig::new("head01"))
+        .handler(Collect::<CounterService>::new())
+        .handler(Collect::<CounterService>::new())
+        .listen(TestCluster::server_endpoint())
         .build()
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Config);
@@ -854,9 +678,8 @@ fn two_services_with_one_name_are_rejected() {
 
 #[test]
 fn a_nameless_engine_is_rejected() {
-    let network = MockNetwork::new();
-    let err = NodeEngine::builder(network.transport())
-        .listen(MockNetwork::endpoint("server"))
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .listen(TestCluster::server_endpoint())
         .build()
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Config);

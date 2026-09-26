@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+// What the agent costs, and whether it is keeping up.
+//
+// An agent that quietly drops half a node's metrics, or spends more CPU than the
+// jobs it is measuring, is worse than no agent at all — a monitoring tool has to
+// be accountable for its own overhead. Columnar like every other batch: one
+// timestamp array, one array per metric.
+package cs.selfmon.v1;
+
+// One agent's samples over one batch window.
+message SelfmonBatch {
+  // When each sample was taken, milliseconds since the unix epoch. Every series
+  // has exactly this many values, or none at all when the figure is unavailable.
+  repeated uint64 sampled_unix_ms = 1;
+
+  // --- the engine's own counters, from ServiceCtx::engine_stats()
+  //
+  // Cumulative unless noted. The queue depths are gauges: they are the *current*
+  // backlog, which is the point of watching them.
+  repeated uint64 frames_sent = 10;
+  repeated uint64 frames_received = 11;
+  repeated uint64 bytes_sent = 12;
+  repeated uint64 bytes_received = 13;
+  repeated uint64 reconnects = 14;
+  // Peers connected right now. 0 or 1 on an agent.
+  repeated uint64 peers = 15;
+  repeated uint64 data_queue_depth = 16;
+  repeated uint64 control_queue_depth = 17;
+  // **The number that matters most here.** Non-zero means this agent threw away
+  // metrics it had already collected, because the outage outlasted its buffer.
+  repeated uint64 data_dropped = 18;
+  // Frames that arrived for a service nobody handles — a rollout half-done.
+  repeated uint64 unroutable_frames = 19;
+  repeated uint64 commands_completed = 20;
+  repeated uint64 commands_expired = 21;
+
+  // --- this process, from /proc/self
+  //
+  // CPU is cumulative microseconds; resident memory is a gauge in bytes.
+  repeated uint64 process_cpu_usec = 30;
+  repeated uint64 process_rss_bytes = 31;
+  repeated uint64 process_threads = 32;
+
+  // --- one entry per registered service
+  repeated ServiceSeries services = 40;
+
+  // --- one entry per thread name
+  repeated ThreadSeries threads = 50;
+}
+
+// One service's counters over the window.
+message ServiceSeries {
+  // The service's name.
+  string service = 1;
+
+  // Cumulative.
+  repeated uint64 messages_sent = 2;
+  repeated uint64 messages_received = 3;
+  repeated uint64 samples = 4;
+  repeated uint64 sample_errors = 5;
+  // Total and worst time inside `sample()`. The worst case is what says a sampler
+  // is overrunning its interval; an average hides it.
+  repeated uint64 sample_time_total_usec = 6;
+  repeated uint64 sample_time_max_usec = 7;
+  // Times the service crashed and was rebuilt, and times it was restarted by
+  // command.
+  repeated uint64 panics = 8;
+  repeated uint64 restarts = 9;
+}
+
+// One thread name's CPU over the window.
+//
+// This is what the `<service>/<worker>` naming convention is for: the kernel
+// accounts CPU per thread, so naming threads after their plugin is what makes
+// "which plugin is expensive" answerable at all.
+message ThreadSeries {
+  // The thread name as the kernel has it, from /proc/self/task/<tid>/comm.
+  // Truncated by the kernel at 15 bytes.
+  string thread = 1;
+  // The part before the `/`, when the name has one: the service this thread
+  // belongs to. Empty for the runtime's own threads, which is deliberate — it
+  // makes the framework's overhead visible next to the plugins'.
+  string service = 2;
+  // Cumulative CPU, microseconds, summed across every thread with this name.
+  //
+  // Summed because a tid means nothing to a server and a name means something.
+  // The consequence: when a service is rebuilt its thread is replaced and the new
+  // one starts from zero, so this can step *down* across a restart. A decrease
+  // here is a restart, not a bad reading.
+  repeated uint64 cpu_usec = 3;
+}

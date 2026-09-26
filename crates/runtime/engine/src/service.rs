@@ -5,7 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use cs_api::runtime::{DataSink, ServiceRuntime, WorkerHost};
 use cs_api::{
-    Command, Data, Handler, JobInfo, Outbox, Reply, Sampler, SamplerFactory, ServiceBound,
+    Command, Data, Handler, JobInfo, Origin, Outbox, Reply, Sampler, SamplerFactory, ServiceBound,
     ServiceCtx, ServiceDef, ServiceId, Wire,
 };
 use cs_async_util::{BoxFuture, Clock, ShutdownSignal};
@@ -35,26 +35,6 @@ impl Jobs {
 
     pub(crate) fn replace(&self, jobs: Vec<JobInfo>) {
         *lock(&self.inner) = Arc::new(jobs);
-    }
-}
-
-/// Where the engine gets the node's job list.
-///
-/// Implemented by whatever knows how to enumerate jobs — on a real node, a cgroup
-/// walk. Called on a named worker thread, so blocking filesystem reads are
-/// expected and fine.
-pub trait JobSource: Send + Sync + 'static {
-    /// Every job step currently on this node.
-    fn jobs(&self) -> Result<Vec<JobInfo>>;
-}
-
-/// A job source for a node with no jobs — the default, and what a server uses.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct NoJobs;
-
-impl JobSource for NoJobs {
-    fn jobs(&self) -> Result<Vec<JobInfo>> {
-        Ok(Vec::new())
     }
 }
 
@@ -594,8 +574,11 @@ enum Handled<S> {
 pub(crate) trait ErasedHandler: Send + Sync + 'static {
     fn id(&self) -> ServiceId;
 
-    /// Decode and handle one message.
-    fn handle(self: Arc<Self>, payload: Bytes) -> BoxFuture<'static, Result<()>>;
+    /// Decode and handle one message from `from`.
+    ///
+    /// The origin is owned rather than borrowed because the future outlives the
+    /// frame it came from: the engine spawns it and moves on to the next read.
+    fn handle(self: Arc<Self>, from: Sender, payload: Bytes) -> BoxFuture<'static, Result<()>>;
 
     /// Release resources, during server shutdown.
     fn shutdown(self: Arc<Self>) -> BoxFuture<'static, ()>;
@@ -611,17 +594,33 @@ impl<H: Handler> ErasedHandler for HandlerEntry<H> {
         ServiceId::of::<H::Service>()
     }
 
-    fn handle(self: Arc<Self>, payload: Bytes) -> BoxFuture<'static, Result<()>> {
+    fn handle(self: Arc<Self>, from: Sender, payload: Bytes) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
-            let message = <Data<H> as Wire>::decode(payload)
-                .map_err(|err| err.context(format!("decoding {} data", H::Service::NAME)))?;
-            self.handler.handle(&self.ctx, message).await
+            let message = <Data<H> as Wire>::decode(payload).map_err(|err| {
+                err.context(format!(
+                    "decoding {} data from {}",
+                    H::Service::NAME,
+                    from.node
+                ))
+            })?;
+            let origin = Origin {
+                node: &from.node,
+                service_version: from.service_version,
+            };
+            self.handler.handle(&self.ctx, origin, message).await
         })
     }
 
     fn shutdown(self: Arc<Self>) -> BoxFuture<'static, ()> {
         Box::pin(async move { self.handler.shutdown().await })
     }
+}
+
+/// An owned [`Origin`], for a handler future that outlives the frame.
+#[derive(Clone, Debug)]
+pub(crate) struct Sender {
+    pub(crate) node: String,
+    pub(crate) service_version: u32,
 }
 
 /// How a handler is built once the engine's internals exist.
