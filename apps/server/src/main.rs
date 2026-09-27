@@ -13,13 +13,16 @@
 mod report;
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use cs_engine::{EngineConfig, EngineHandle, NodeEngine, Stop};
+use cs_plugin_selfmon::{SelfmonConfig, SelfmonSampler};
+use cs_plugin_snapshot::{SnapshotSampler, Snapshots};
 use cs_transport::{Endpoint, Transport};
 use cs_util::{Error, ErrorKind, Result, ResultExt};
 use tracing::{error, info, warn};
 
-use crate::report::{CgroupReport, SelfmonReport, Tally};
+use crate::report::{CgroupReport, SelfmonReport, SnapshotReport, Tally};
 
 /// Where to listen when nothing says otherwise.
 const DEFAULT_LISTEN: &str = "tcp://0.0.0.0:7777";
@@ -121,10 +124,40 @@ async fn run<T: Transport>(transport: T, args: &Args) -> Result<Stop> {
         .config(EngineConfig::new(&args.node))
         .build_id(concat!("cs-server ", env!("CARGO_PKG_VERSION")))
         // No samplers and no job source: a head produces nothing of its own, it
-        // only receives. One handler per service it knows how to read.
-        .handler(CgroupReport::new(tally.clone()))
-        .handler(SelfmonReport::new(tally.clone()))
+        // only receives.
         .listen(args.listen.clone());
+
+    // Per-job summaries, kept while a step runs and sent up when it ends. Only worth
+    // keeping when there is a tier above to send them to: a head with nothing upstream
+    // would accumulate them and then have nowhere to put them.
+    let snapshots = args
+        .upstream
+        .as_ref()
+        .filter(|_| !args.relay)
+        .map(|_| Snapshots::new());
+
+    // One handler per service it knows how to read — unless it is a relay, whose job
+    // is to pass data on rather than read it. That is the whole difference: the engine
+    // forwards what it has no handler for, so a relay is configured by *not*
+    // registering them, and there is no "forward" switch anywhere in the engine.
+    if !args.relay {
+        let cgroup = match &snapshots {
+            Some(snapshots) => CgroupReport::new(tally.clone()).summarising(snapshots.clone()),
+            None => CgroupReport::new(tally.clone()),
+        };
+        builder = builder
+            .handler(cgroup)
+            .handler(SelfmonReport::new(tally.clone()))
+            // A head also reads the snapshots *below* it, which is what makes a cluster
+            // head under a global tier work: it summarises its own nodes and passes on
+            // what its children already summarised.
+            .handler(SnapshotReport::new(tally.clone()));
+    }
+
+    if let Some(snapshots) = &snapshots {
+        info!("keeping per-job snapshots and sending them upstream");
+        builder = builder.sampler(SnapshotSampler::factory(snapshots.clone()));
+    }
 
     // A second endpoint, for `cs-ctl`. Commands arriving there name a node and are
     // forwarded to it; commands arriving on the agents' endpoint are not.
@@ -138,8 +171,20 @@ async fn run<T: Transport>(transport: T, args: &Args) -> Result<Stop> {
     // them. What it cannot yet do is forward their *metrics*: a batch for a service
     // it has no handler for is counted and dropped, which is at least visible.
     if let Some(upstream) = &args.upstream {
-        info!(upstream = upstream.as_str(), "relaying to a tier above");
-        builder = builder.dial(upstream.clone());
+        info!(
+            upstream = upstream.as_str(),
+            relay = args.relay,
+            "reporting to a tier above"
+        );
+        builder = builder
+            .dial(upstream.clone())
+            // A tier in the middle reports on itself to the tier above, through the
+            // same plugin an agent uses and on the same terms — batched, chunked,
+            // queued, dropped under pressure. That is how `data_forwarded` becomes
+            // visible at all: a relay with no sampler is a relay nobody can see.
+            .sampler(SelfmonSampler::factory_with(
+                SelfmonConfig::new().batching_for(Duration::from_secs(30)),
+            ));
     }
 
     let engine = builder.build().context("building the engine")?;
@@ -198,9 +243,12 @@ Options:
   -l, --listen <endpoint>  where to accept agents, as scheme://authority
                            (default: $CS_LISTEN, else tcp://0.0.0.0:7777)
   -u, --upstream <endpoint>
-                           a tier above to report to, which makes this a relay:
-                           it announces the nodes below it and passes their
-                           commands down (default: $CS_UPSTREAM, else none)
+                           a tier above to report to: this head announces the
+                           nodes below it and passes their commands down
+                           (default: $CS_UPSTREAM, else none)
+      --relay              register no handlers, so every batch received is
+                           passed upward with its producer's name attached
+                           rather than read here. Needs --upstream.
   -a, --admin <endpoint>   where to accept operators running cs-ctl
                            (default: $CS_ADMIN, else tcp://127.0.0.1:7788)
                            Reaching this endpoint is the only authorization
@@ -226,8 +274,10 @@ struct Args {
     listen: Endpoint,
     /// Where operators connect, or `None` for a head nobody can command.
     admin: Option<Endpoint>,
-    /// The tier above, if this is a relay rather than the top.
+    /// The tier above, if this is not the top.
     upstream: Option<Endpoint>,
+    /// Register no handlers, so everything received is passed upward untouched.
+    relay: bool,
     node: String,
 }
 
@@ -247,6 +297,7 @@ impl Args {
         let mut listen = std::env::var("CS_LISTEN").unwrap_or_else(|_| DEFAULT_LISTEN.to_owned());
         let mut admin = std::env::var("CS_ADMIN").unwrap_or_else(|_| DEFAULT_ADMIN.to_owned());
         let mut upstream = std::env::var("CS_UPSTREAM").ok();
+        let mut relay = false;
         let mut serving_operators = true;
         let mut node = std::env::var("CS_NODE").ok();
 
@@ -257,6 +308,7 @@ impl Args {
                 "-l" | "--listen" => listen = value(&mut args, &arg)?,
                 "-a" | "--admin" => admin = value(&mut args, &arg)?,
                 "-u" | "--upstream" => upstream = Some(value(&mut args, &arg)?),
+                "--relay" => relay = true,
                 "--no-admin" => serving_operators = false,
                 "-n" | "--node" => node = Some(value(&mut args, &arg)?),
                 other => {
@@ -268,6 +320,14 @@ impl Args {
             }
         }
 
+        if relay && upstream.is_none() {
+            return Err(Error::new(
+                ErrorKind::Config,
+                "--relay needs --upstream: a relay with nowhere to pass data would \
+                 register no handlers and drop everything",
+            ));
+        }
+
         Ok(Parsed::Run(Self {
             listen: Endpoint::parse(&listen).with_context(|| format!("--listen {listen:?}"))?,
             admin: serving_operators
@@ -277,6 +337,7 @@ impl Args {
                 .as_deref()
                 .map(|up| Endpoint::parse(up).with_context(|| format!("--upstream {up:?}")))
                 .transpose()?,
+            relay,
             node: node.unwrap_or_else(hostname),
         }))
     }
@@ -349,6 +410,20 @@ mod tests {
         assert!(
             parse(&["--no-admin"]).expect("refused").admin.is_none(),
             "--no-admin should leave nothing to connect to"
+        );
+    }
+
+    /// A relay is configured by having no handlers, so `--relay` without anywhere to
+    /// pass data would silently drop every batch it received.
+    #[test]
+    fn relaying_without_an_upstream_is_rejected() {
+        let err = parse(&["--relay"]).expect_err("nowhere to relay to");
+        assert_eq!(err.kind(), ErrorKind::Config);
+        assert!(err.to_string().contains("--upstream"), "{err}");
+        assert!(
+            parse(&["--relay", "--upstream", "tcp://global:7777"])
+                .expect("a relay")
+                .relay
         );
     }
 

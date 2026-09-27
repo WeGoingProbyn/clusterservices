@@ -138,6 +138,11 @@ pub(crate) struct Wiring {
     /// The engine's routing knowledge: where a named node is, what we can reach,
     /// and what a child tells us it can reach.
     pub(crate) routing: Arc<dyn Routing>,
+    /// The queue to the tier above, when there is one.
+    ///
+    /// Present means this engine is in the middle of something, which is the whole
+    /// test for whether data it cannot read should be passed on rather than dropped.
+    pub(crate) uplink: Option<Arc<PeerQueue>>,
 }
 
 /// How the engine was asked to stop.
@@ -234,9 +239,12 @@ pub(crate) async fn write_loop<Tx: FrameTx>(
 
         let result = match item {
             Outgoing::Control(frame) => send(&mut tx, frame, &wiring).await,
-            Outgoing::Data { service, payload } => {
-                write_data(&mut tx, &peer, service, payload, &wiring).await
-            }
+            Outgoing::Data {
+                service,
+                version,
+                payload,
+                origin,
+            } => write_data(&mut tx, &peer, &service, version, payload, &origin, &wiring).await,
         };
         match result {
             Ok(()) => last_write.mark(wiring.clock.now()),
@@ -256,11 +264,15 @@ pub(crate) async fn write_loop<Tx: FrameTx>(
 async fn write_data<Tx: FrameTx>(
     tx: &mut Tx,
     peer: &Peer,
-    service: ServiceId,
+    service: &str,
+    version: u32,
     payload: bytes::Bytes,
+    origin: &str,
     wiring: &Wiring,
 ) -> Result<()> {
-    let pieces = split(service.name, payload, wiring.max_frame)?;
+    // The origin is part of the envelope, so it has to be known *before* the payload
+    // is sized: a forwarded frame carries the producer's name in every chunk.
+    let pieces = split(service, origin, payload, wiring.max_frame)?;
     let message_id = if pieces.len() > 1 {
         peer.next_message_id()
     } else {
@@ -269,15 +281,21 @@ async fn write_data<Tx: FrameTx>(
 
     for (chunk, piece) in pieces {
         let frame = match chunk {
-            Some(chunk) => Frame::Data(DataFrame::chunked(
-                service.name,
-                service.version,
+            Some(chunk) => DataFrame::chunked(
+                service,
+                version,
                 Chunk::new(message_id, chunk.index, chunk.count),
                 piece,
-            )),
-            None => Frame::Data(DataFrame::new(service.name, service.version, piece)),
+            ),
+            None => DataFrame::new(service, version, piece),
         };
-        send(tx, frame, wiring).await?;
+        // Empty for data this engine measured: the peer knows who we are.
+        let frame = if origin.is_empty() {
+            frame
+        } else {
+            frame.produced_by(origin)
+        };
+        send(tx, Frame::Data(frame), wiring).await?;
     }
     Ok(())
 }
@@ -414,26 +432,29 @@ async fn route(
 ) -> Option<GoodbyeReason> {
     match frame {
         Frame::Data(data) => {
-            let payload = match data.chunk {
-                None => Some(data.payload),
-                Some(chunk) => match reassembler.push(&data.service, chunk, data.payload) {
-                    Reassembled::Complete(whole) => Some(whole),
-                    Reassembled::Partial => None,
-                    Reassembled::Rejected(why) => {
-                        wiring
-                            .counters
-                            .unroutable_frames
-                            .fetch_add(1, Ordering::Relaxed);
-                        warn!(node = %peer.node, service = %data.service, why, "bad chunk");
-                        None
+            let whole = match data.chunk {
+                None => Some((data.payload, data.origin)),
+                Some(chunk) => {
+                    match reassembler.push(&data.service, &data.origin, chunk, data.payload) {
+                        Reassembled::Complete { payload, origin } => Some((payload, origin)),
+                        Reassembled::Partial => None,
+                        Reassembled::Rejected(why) => {
+                            wiring
+                                .counters
+                                .unroutable_frames
+                                .fetch_add(1, Ordering::Relaxed);
+                            warn!(node = %peer.node, service = %data.service, why, "bad chunk");
+                            None
+                        }
                     }
-                },
+                }
             };
-            if let Some(payload) = payload {
+            if let Some((payload, origin)) = whole {
                 dispatch_data(
                     &data.service,
                     data.service_version,
                     payload,
+                    &origin,
                     peer,
                     wiring,
                     handlers,
@@ -512,25 +533,55 @@ fn dispatch_data(
     service: &str,
     service_version: u32,
     payload: bytes::Bytes,
+    origin: &str,
     peer: &Arc<Peer>,
     wiring: &Wiring,
     handlers: &mut JoinSet<Result<()>>,
 ) {
+    // Who measured it: the origin if something forwarded it, otherwise the peer that
+    // handed it over. This is the whole reason `Data.origin` exists — a relay's
+    // parent must not credit a rack's metrics to the relay.
+    let producer = if origin.is_empty() {
+        peer.node.as_str()
+    } else {
+        origin
+    };
+
     let Some(handler) = wiring.handlers.get(service) else {
+        // Nothing here can read it — but if there is a tier above, it may be able to.
+        // Passing it on is what makes a relay a relay, and it needs no handler and no
+        // configuration: a middle tier is one that has somewhere to pass things.
+        if let Some(uplink) = &wiring.uplink {
+            match uplink.push_data_owned(service, service_version, payload, producer) {
+                Ok(()) => {
+                    debug!(node = %peer.node, service, producer, "forwarding data upward");
+                    wiring
+                        .counters
+                        .data_forwarded
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Err(err) => {
+                    wiring
+                        .counters
+                        .unroutable_frames
+                        .fetch_add(1, Ordering::Relaxed);
+                    debug!(node = %peer.node, service, error = ?err, "cannot forward data");
+                }
+            }
+            return;
+        }
         // Log, count, drop — never kill the connection. A node running a plugin
         // this server has never heard of is a rollout in progress, not an error.
         wiring
             .counters
             .unroutable_frames
             .fetch_add(1, Ordering::Relaxed);
-        debug!(node = %peer.node, service, "no handler for this service; dropping");
+        debug!(node = %peer.node, service, "no handler for this service and nowhere to send it");
         return;
     };
     wiring.counters.message_received(handler.id().name);
     let from = Sender {
-        // One and the same for now: nothing forwards yet, so the peer that sent
-        // this is the node that measured it.
-        node: peer.node.clone(),
+        node: producer.to_owned(),
         via: peer.node.clone(),
         service_version,
     };

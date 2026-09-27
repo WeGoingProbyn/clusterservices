@@ -561,7 +561,7 @@ mod tests {
         let (_listener, client, _server) = pair(&network).await;
         let (mut tx, _) = client.split();
 
-        let limit = DataFrame::max_payload(256, "cgroup", None);
+        let limit = DataFrame::max_payload(256, "cgroup", "", None);
         tx.send(Frame::Data(DataFrame::new(
             "cgroup",
             u32::MAX,

@@ -45,6 +45,14 @@ pub struct EngineStats {
     pub data_dropped: u64,
     /// Frames discarded because no service claimed the name on them.
     pub unroutable_frames: u64,
+
+    /// Messages this engine could not read and passed to the tier above instead.
+    ///
+    /// Non-zero means this engine is acting as a relay for a service it has no
+    /// handler for — which is either the point of it, or a handler somebody forgot to
+    /// register. Counted separately from `unroutable_frames` for exactly that reason:
+    /// forwarded and dropped are different outcomes and must not look alike.
+    pub data_forwarded: u64,
     /// Commands whose results came back.
     pub commands_completed: u64,
     /// Commands that expired in a queue without being delivered.

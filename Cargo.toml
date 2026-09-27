@@ -23,6 +23,7 @@ cs-testkit = { path = "crates/runtime/testkit" }
 # plugins
 cs-plugin-cgroup = { path = "crates/plugins/cgroup" }
 cs-plugin-selfmon = { path = "crates/plugins/selfmon" }
+cs-plugin-snapshot = { path = "crates/plugins/snapshot" }
 # third party
 bytes = "1"
 prost = "0.14"

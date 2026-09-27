@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -597,19 +597,22 @@ impl<T: Transport> EngineBuilder<T> {
     pub fn build(self) -> Result<NodeEngine<T>> {
         self.config.validate().context("engine configuration")?;
 
-        let mut seen = HashMap::new();
-        for id in self
-            .samplers
-            .iter()
-            .map(|(id, _)| *id)
-            .chain(self.handlers.iter().map(|(id, _)| *id))
-        {
-            if seen.insert(id.name, id).is_some() {
-                return Err(Error::new(
-                    ErrorKind::Config,
-                    format!("service {:?} is registered twice", id.name),
-                ));
-            }
+        // Two samplers, or two handlers, with one name would make routing ambiguous.
+        // A sampler *and* a handler for the same service is not a mistake, though: it
+        // is what a cluster head does with `selfmon`, reporting on itself to the tier
+        // above while reading what its own nodes report. They are opposite directions
+        // through one name, and they live in separate tables.
+        if let Some(name) = first_duplicate(self.samplers.iter().map(|(id, _)| id.name)) {
+            return Err(Error::new(
+                ErrorKind::Config,
+                format!("two samplers are registered for service {name:?}"),
+            ));
+        }
+        if let Some(name) = first_duplicate(self.handlers.iter().map(|(id, _)| id.name)) {
+            return Err(Error::new(
+                ErrorKind::Config,
+                format!("two handlers are registered for service {name:?}"),
+            ));
         }
 
         if self.admin.is_some() && self.listen.is_none() {
@@ -773,6 +776,7 @@ impl<T: Transport> NodeEngine<T> {
 
         let wiring = Wiring {
             routing: Arc::clone(&inner) as Arc<dyn Routing>,
+            uplink: self.uplink.clone(),
             config: Arc::clone(&self.config),
             counters: Arc::clone(&self.counters),
             commands: Arc::clone(&inner.commands),
@@ -1069,6 +1073,13 @@ impl EngineHandle {
     pub fn listening(&self) -> Option<Endpoint> {
         lock(&self.listening).clone()
     }
+}
+
+/// The first name that appears twice, if any.
+fn first_duplicate(names: impl Iterator<Item = &'static str>) -> Option<&'static str> {
+    let mut seen = HashSet::new();
+    let mut names = names;
+    names.find(|name| !seen.insert(*name))
 }
 
 /// Tell the tier above what we can reach, whenever that changes.

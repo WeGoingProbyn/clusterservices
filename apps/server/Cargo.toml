@@ -22,6 +22,7 @@ cs-util.workspace = true
 # does not matter yet.
 cs-plugin-cgroup.workspace = true
 cs-plugin-selfmon.workspace = true
+cs-plugin-snapshot.workspace = true
 # Multi-threaded, unlike the agent: a head serves many agents and runs their
 # handlers concurrently.
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time"] }

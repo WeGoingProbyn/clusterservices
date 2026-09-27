@@ -63,6 +63,17 @@ message Data {
   uint32 chunk_index = 5;
   // Total chunks in this message. 0 means "not chunked".
   uint32 chunk_count = 6;
+
+  // The node that **produced** this data, when that is not the peer sending it.
+  //
+  // Empty on the hop from the node that measured it, where the connection already
+  // says who that was. Set by the first tier that forwards data upward, and
+  // preserved unchanged by every tier above — so a relay's parent attributes a
+  // batch to the agent that produced it rather than to the relay.
+  //
+  // Field 7 keeps its tag to a single byte, which matters: `DataFrame::max_payload`
+  // sizes chunks against the whole envelope, and this field is part of it.
+  string origin = 7;
 }
 
 // An agent introducing itself. Sent once, before any data.

@@ -1,0 +1,26 @@
+[package]
+name = "cs-plugin-snapshot"
+description = "Per-job snapshots: fold batches into mergeable summaries and send them upstream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Rule 2, and it matters more here than usual: this crate summarises *any* plugin's
+# batch through `cs_api::Metrics`, so it must not know about cgroup, gpu or anything
+# else. If it ever needs a plugin's message type, the abstraction has failed.
+cs-api.workspace = true
+
+[build-dependencies]
+prost-build.workspace = true
+protox.workspace = true
+
+[dev-dependencies]
+cs-api = { workspace = true, features = ["test-util"] }
+# Only to summarise real batches in the tests, which is the honest way to check the
+# mapping: a fake batch would test the fake.
+cs-plugin-cgroup.workspace = true
+
+[lints]
+workspace = true

@@ -665,17 +665,54 @@ fn a_sampler_with_nowhere_to_send_is_rejected() {
     assert!(err.to_string().contains("upstream to dial"));
 }
 
-#[test]
-fn two_services_with_one_name_are_rejected() {
-    let err = NodeEngine::builder(MockNetwork::new().transport())
+/// A cluster head does this: it reports on *itself* with the selfmon sampler while
+/// reading what its own nodes report with the selfmon handler. Rejecting it made a
+/// three-tier deployment refuse to start, which is how it was found.
+#[tokio::test]
+async fn a_sampler_and_a_handler_may_share_a_service_name() {
+    let counter = CounterConfig::new();
+    let collected = Collect::<CounterService>::new();
+
+    let engine = NodeEngine::builder(MockNetwork::new().transport())
         .config(EngineConfig::new("head01"))
-        .handler(Collect::<CounterService>::new())
-        .handler(Collect::<CounterService>::new())
         .listen(TestCluster::server_endpoint())
+        .dial(MockNetwork::endpoint("global"))
+        .sampler(counter.factory())
+        .handler(collected)
+        .build();
+
+    assert!(
+        engine.is_ok(),
+        "opposite directions through one name: {:?}",
+        engine.err()
+    );
+}
+
+#[test]
+fn two_samplers_with_one_name_are_rejected() {
+    let counter = CounterConfig::new();
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .config(EngineConfig::new("node-1"))
+        .dial(TestCluster::server_endpoint())
+        .sampler(counter.factory())
+        .sampler(counter.factory())
         .build()
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Config);
-    assert!(err.to_string().contains("registered twice"));
+    assert!(err.to_string().contains("two samplers"), "{err}");
+}
+
+#[test]
+fn two_handlers_with_one_name_are_rejected() {
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .config(EngineConfig::new("head01"))
+        .listen(TestCluster::server_endpoint())
+        .handler(Collect::<CounterService>::new())
+        .handler(Collect::<CounterService>::new())
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Config);
+    assert!(err.to_string().contains("two handlers"), "{err}");
 }
 
 #[test]

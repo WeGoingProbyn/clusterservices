@@ -102,6 +102,9 @@ crates/
   plugins/
     cgroup/        cs-plugin-cgroup   Per-job cgroup v2 sampler,      2035 loc ✅
                                    plus the JobSource that finds them.
+    snapshot/      cs-plugin-snapshot Per-job summaries that merge:   ~1500 loc ✅
+                                   one per (node, job, step), sent
+                                   upward when the step ends.
     gpu/           cs-plugin-gpu      Shared-GPU attribution via NVML.          ⬜
     selfmon/       cs-plugin-selfmon  Engine counters, process cost,  1571 loc ✅
                                    and CPU per plugin thread.
@@ -212,7 +215,7 @@ Use `--all-features`: `test_support` and its doctests sit behind `test-util`, an
 later transports have features of their own.
 
 External dependencies are few and deliberate: `bytes`, `prost`, `tokio`,
-`tracing`, and `protox` at build time. 467 tests, no `unsafe`, `unwrap`/`expect`
+`tracing`, and `protox` at build time. 534 tests, no `unsafe`, `unwrap`/`expect`
 denied in library code by lint — with one documented exemption for `cs-testkit`,
 whose job is to panic loudly.
 
@@ -266,7 +269,7 @@ A relay is an engine in both roles, so it is the same binary with an upstream:
 
 ```sh
 cs-server -l tcp://0.0.0.0:7777 -n global                         # the top
-cs-server -l tcp://0.0.0.0:7777 -n relay-a --upstream tcp://global:7777
+cs-server -l tcp://0.0.0.0:7777 -n relay-a --upstream tcp://global:7777 --relay
 cs-agent  --server tcp://relay-a:7777                             # a node behind it
 ```
 
@@ -285,9 +288,18 @@ node-1  selfmon     ok
 1 of 1 ok
 ```
 
-What a relay cannot do yet is carry *metrics* upward — that needs `Data.origin`, or
-the head would credit every agent's numbers to the relay. It counts and drops a batch
-it has no handler for, which is at least visible.
+It carries metrics too. `--relay` on the middle tier registers no handlers, and the
+engine passes on what it cannot read with the producer's name attached:
+
+```
+$ # at the global head, which has never spoken to node-1
+node-1  selfmon  4 samples  agent cpu +1.810s rss 26.7MiB  …  [burn/spin0 +1.800s]
+relay-a selfmon  3 samples  agent cpu +10.0ms  rss 8.7MiB   …  relayed 3
+```
+
+The first line is node-1's own metrics, attributed to node-1 rather than to the relay
+in front of it. The second is the relay reporting on itself through the same plugin an
+agent uses, including how much it has passed on.
 
 `cs-ctl` talks to a **second** port (`tcp://127.0.0.1:7788` by default, loopback on
 purpose: reaching it is the only authorization there is). The head forwards each
@@ -351,7 +363,9 @@ behavioural contracts. The decisions most likely to surprise a reader of the cod
 | 6 | `cs-transport-tcp`; contract suite on both transports | ✅ done |
 | 7 | Plugins: cgroup ✅, selfmon ✅, then gpu | |
 | 8 | Apps: server ✅, agent ✅, ctl ✅ | |
-| 9 | Reachability + routing: a relay carries commands and `status` ✅ | `Data.origin` left |
+| 9 | The relay tier: reachability, routing, `status`, `Data.origin` ✅ | |
+| 10 | Per-job snapshots ✅ | |
+| 11 | The aggregator: storage, a Slurm-joined job record, opt-in raw streaming | ← next |
 | 9 | Later: gRPC transport, relay tier, eBPF, RDMA | |
 
 Adding a transport is: implement the traits, write a `TestTransport` fixture, and

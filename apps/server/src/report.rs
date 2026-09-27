@@ -13,6 +13,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use cs_api::{Handler, Origin, Result, ServiceBound, ServiceCtx};
 use cs_plugin_cgroup::{CgroupBatch, CgroupService};
 use cs_plugin_selfmon::{SelfmonBatch, SelfmonService};
+use cs_plugin_snapshot::{
+    CloseReason, JobSnapshot, Kind, MetricSummary, SnapshotService, Snapshots, StepKey,
+};
 use tracing::{info, warn};
 
 /// What a handler has seen, for the summary at shutdown.
@@ -48,13 +51,30 @@ impl Tally {
 #[derive(Clone, Debug, Default)]
 pub struct CgroupReport {
     tally: Tally,
+    /// Where each batch is folded into its step's running summary, when this head is
+    /// keeping them. `None` on a head that only logs.
+    snapshots: Option<Snapshots>,
 }
 
 impl CgroupReport {
     /// A handler sharing `tally`.
     #[must_use]
     pub fn new(tally: Tally) -> Self {
-        Self { tally }
+        Self {
+            tally,
+            snapshots: None,
+        }
+    }
+
+    /// Also fold every batch into a per-job snapshot.
+    ///
+    /// The accumulator is shared with a [`SnapshotSampler`](cs_plugin_snapshot::SnapshotSampler),
+    /// which sends whatever has finished to the tier above — so this is only worth doing
+    /// on a head that has one.
+    #[must_use]
+    pub fn summarising(mut self, snapshots: Snapshots) -> Self {
+        self.snapshots = Some(snapshots);
+        self
     }
 }
 
@@ -65,12 +85,26 @@ impl ServiceBound for CgroupReport {
 impl Handler for CgroupReport {
     async fn handle(
         &self,
-        _ctx: &ServiceCtx<CgroupService>,
+        ctx: &ServiceCtx<CgroupService>,
         from: Origin<'_>,
         batch: CgroupBatch,
     ) -> Result<()> {
         let samples = batch.sampled_unix_ms.len();
         self.tally.record(samples);
+
+        // Fold before logging, so a head that is summarising keeps the numbers even if
+        // the formatting below is changed or removed. `from.node` and not `from.via`:
+        // the snapshot belongs to the node that measured it, which is not the relay that
+        // handed it over.
+        if let (Some(snapshots), Some(job)) = (&self.snapshots, batch.job.as_ref()) {
+            snapshots.fold(
+                &StepKey::new(from.node, job.job_id, &job.step),
+                job.uid,
+                &batch,
+                batch.r#final,
+                ctx.clock().now(),
+            );
+        }
 
         let job = batch.job.as_ref().map_or_else(
             || "<no job>".to_owned(),
@@ -155,8 +189,15 @@ impl Handler for SelfmonReport {
             .collect();
         threads.sort_unstable();
 
+        // A relay says so, because "this agent is passing data through" is not a
+        // warning but it changes how every other number should be read.
+        let relaying = match delta(&batch.data_forwarded).filter(|&n| n > 0) {
+            Some(forwarded) => format!("  relayed {forwarded}"),
+            None => String::new(),
+        };
+
         info!(
-            "{} selfmon  {samples} samples  agent {} rss {} threads {}  queue {}d/{}c  frames {}{}",
+            "{} selfmon  {samples} samples  agent {} rss {} threads {}  queue {}d/{}c  frames {}{}{}",
             from.node,
             delta(&batch.process_cpu_usec).map_or_else(
                 || "cpu n/a".to_owned(),
@@ -172,6 +213,7 @@ impl Handler for SelfmonReport {
             } else {
                 format!("  [{}]", threads.join(", "))
             },
+            relaying,
         );
 
         // The two numbers that mean something is wrong, rather than merely
@@ -255,6 +297,114 @@ fn bytes(count: u64) -> String {
         format!("{count}B")
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+/// Reports snapshots as they arrive: what an aggregator will store, logged instead.
+///
+/// One line per job step, with the figures a person actually asks for — how much CPU,
+/// at what rate, how much memory at its peak — and a marker when the snapshot is
+/// missing its tail, because a truncated job must not read like a short one.
+pub struct SnapshotReport {
+    tally: Tally,
+}
+
+impl SnapshotReport {
+    /// A handler sharing `tally`.
+    #[must_use]
+    pub fn new(tally: Tally) -> Self {
+        Self { tally }
+    }
+}
+
+impl ServiceBound for SnapshotReport {
+    type Service = SnapshotService;
+}
+
+impl Handler for SnapshotReport {
+    async fn handle(
+        &self,
+        _ctx: &ServiceCtx<SnapshotService>,
+        from: Origin<'_>,
+        snapshot: JobSnapshot,
+    ) -> Result<()> {
+        self.tally.record(snapshot.samples as usize);
+
+        let cpu = metric(&snapshot, "cpu.usage_usec");
+        let memory = metric(&snapshot, "memory.current");
+        let peak = metric(&snapshot, "memory.peak");
+
+        info!(
+            "{}.{} on {} uid {}  {}  cpu {} (mean {}, peak {})  mem {}  {}{}",
+            snapshot.job_id,
+            snapshot.step,
+            snapshot.node,
+            snapshot.uid,
+            elapsed(snapshot.last_unix_ms.saturating_sub(snapshot.first_unix_ms)),
+            cpu.map_or_else(|| "n/a".to_owned(), |m| duration(m.total)),
+            // A counter's statistics are rates, in units per second — microseconds of
+            // CPU per second is cores, which is the number anyone means.
+            cpu.and_then(cores)
+                .map_or_else(|| "n/a".to_owned(), |c| format!("{c:.2}")),
+            cpu.and_then(peak_cores)
+                .map_or_else(|| "n/a".to_owned(), |c| format!("{c:.2}")),
+            // Prefer the kernel's own peak: it catches spikes between samples, which
+            // is the only reason it is carried alongside `memory.current`.
+            peak.filter(|m| m.samples > 0).map_or_else(
+                || memory.map_or_else(|| "n/a".to_owned(), |m| bytes(m.max.max(0.0) as u64)),
+                |m| format!("{} (kernel peak)", bytes(m.last)),
+            ),
+            match CloseReason::try_from(snapshot.closed_because) {
+                Ok(CloseReason::StepEnded) => "ended",
+                Ok(CloseReason::Silent) => "went silent",
+                Ok(CloseReason::Periodic) => "partial",
+                Ok(CloseReason::Shutdown) => "head stopped",
+                _ => "unknown",
+            },
+            if from.is_direct() {
+                String::new()
+            } else {
+                format!("  via {}", from.via)
+            },
+        );
+
+        if !snapshot.complete {
+            // Worth its own line: a reader joining these into a job record has to know
+            // that more may follow, or that a tail is missing for good.
+            warn!(
+                job = snapshot.job_id,
+                step = %snapshot.step,
+                node = %snapshot.node,
+                "an incomplete snapshot: it will need merging or it lost its tail"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One metric out of a snapshot, if the node had it.
+fn metric<'a>(snapshot: &'a JobSnapshot, name: &str) -> Option<&'a MetricSummary> {
+    snapshot.metrics.iter().find(|m| m.metric == name)
+}
+
+/// A counter's mean rate as cores, for a metric measured in microseconds.
+fn cores(metric: &MetricSummary) -> Option<f64> {
+    (metric.kind == Kind::Counter as i32 && metric.weight > 0.0)
+        .then(|| metric.sum / metric.weight / 1_000_000.0)
+}
+
+/// The busiest interval, as cores.
+fn peak_cores(metric: &MetricSummary) -> Option<f64> {
+    (metric.samples > 0).then_some(metric.max / 1_000_000.0)
+}
+
+/// A wall-clock span in milliseconds, read at a glance.
+fn elapsed(millis: u64) -> String {
+    let secs = millis / 1000;
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => format!("{}m{}s", secs / 60, secs % 60),
+        _ => format!("{}h{}m", secs / 3600, (secs % 3600) / 60),
     }
 }
 

@@ -68,6 +68,7 @@ mod command;
 mod ctx;
 mod handler;
 mod job;
+mod metric;
 mod sampler;
 mod service;
 mod stats;
@@ -82,6 +83,7 @@ pub use command::{Command, CommandOpts, CommandOutcome, CommandReceiver, Reply};
 pub use ctx::{MAX_THREAD_NAME_LEN, Outbox, ServiceCtx, WorkerSpawner, worker_thread_name};
 pub use handler::{Handler, Origin};
 pub use job::{JobInfo, JobSource, NoJobs, StepId};
+pub use metric::{MetricKind, Metrics, Series};
 pub use sampler::{Sampler, SamplerFactory};
 pub use service::{
     Cmd, Data, MAX_SERVICE_NAME_LEN, ServiceBound, ServiceDef, ServiceId, is_valid_service_name,

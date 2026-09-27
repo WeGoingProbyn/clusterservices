@@ -12,7 +12,10 @@ use std::time::Duration;
 use cs_api::ServiceDef;
 use cs_engine::{EngineHandle, NodeEngine, Stop};
 use cs_operator::Request;
-use cs_testkit::{CounterConfig, CounterService, TestOperator, test_config, wait_for};
+use cs_testkit::{
+    BulkSampler, BulkService, Collect, CounterConfig, CounterService, TestOperator, test_config,
+    wait_for,
+};
 use cs_transport::{Endpoint, Outcome, StatusReport};
 use cs_transport_mock::{MockNetwork, MockTransport};
 use cs_util::ErrorKind;
@@ -111,23 +114,33 @@ struct Tiers {
 }
 
 impl Tiers {
+    fn start() -> Self {
+        Self::start_collecting(None)
+    }
+
+    /// With a handler on the **global** head, so a test can see what arrives after
+    /// crossing two hops.
+    fn collecting(collected: Collect<CounterService>) -> Self {
+        Self::start_collecting(Some(collected))
+    }
+
     #[expect(
         clippy::expect_used,
         reason = "harness code: a broken assumption here is a mistake in the test, and \
                   panicking is how it should say so — the same exemption cs-testkit has"
     )]
-    fn start() -> Self {
+    fn start_collecting(collected: Option<Collect<CounterService>>) -> Self {
         let network = MockNetwork::new();
         let counter = CounterConfig::new();
 
-        let head = Tier::spawn(
-            NodeEngine::builder(network.transport())
-                .config(test_config("head01"))
-                .listen(at("head"))
-                .admin(at("head-admin"))
-                .build()
-                .expect("the head should build"),
-        );
+        let mut head = NodeEngine::builder(network.transport())
+            .config(test_config("head01"))
+            .listen(at("head"))
+            .admin(at("head-admin"));
+        if let Some(collected) = collected {
+            head = head.handler(collected);
+        }
+        let head = Tier::spawn(head.build().expect("the head should build"));
 
         // Both roles at once, which is the whole of what makes a relay.
         let relay = Tier::spawn(
@@ -313,5 +326,98 @@ async fn losing_a_relay_retires_the_nodes_behind_it() {
     );
 
     agent.stop().await;
+    head.stop().await;
+}
+
+/// The reason `Data.origin` exists: metrics crossing a relay must still belong to the
+/// node that measured them.
+///
+/// The relay has no handler for the counter service, so the engine passes it up —
+/// which is the whole of what makes a relay carry data. No configuration and no app
+/// code: a middle tier is simply one with somewhere to pass things.
+#[tokio::test]
+async fn data_crossing_a_relay_keeps_the_node_that_measured_it() {
+    let collected = Collect::<CounterService>::new();
+    let tiers = Tiers::collecting(collected.clone());
+
+    let seen = collected.clone();
+    wait_for("batches to reach the global head", &mut || seen.count() > 0).await;
+
+    assert_eq!(
+        collected.senders().first().map(String::as_str),
+        Some("node-1"),
+        "attribution must survive the hop, or a head credits a whole rack to one relay"
+    );
+    assert_eq!(
+        collected.carriers().first().map(String::as_str),
+        Some("relay-a"),
+        "and `via` says which relay delivered it"
+    );
+
+    // The relay counts what it passed on, separately from what it dropped.
+    let stats = tiers.relay.handle.stats();
+    assert!(
+        stats.data_forwarded > 0,
+        "the relay should have counted its forwarding"
+    );
+    assert_eq!(
+        stats.unroutable_frames, 0,
+        "and none of it should look like a drop"
+    );
+
+    tiers.stop().await;
+}
+
+/// A chunked batch takes the same path, re-split for the upstream link — which is
+/// exactly where forgetting the origin in the size arithmetic would bite.
+#[tokio::test]
+async fn a_chunked_batch_crosses_a_relay_intact() {
+    let collected = Collect::<BulkService>::new();
+    let network = MockNetwork::with_capacity(8).with_max_frame(512);
+
+    let head = Tier::spawn(
+        NodeEngine::builder(network.transport())
+            .config(test_config("head01"))
+            .listen(at("head"))
+            .handler(collected.clone())
+            .build()
+            .expect("the head should build"),
+    );
+    let relay = Tier::spawn(
+        NodeEngine::builder(network.transport())
+            .config(test_config("relay-a"))
+            .listen(at("relay-a"))
+            .dial(at("head"))
+            .build()
+            .expect("the relay should build"),
+    );
+    let agent = Tier::spawn(
+        NodeEngine::builder(network.transport())
+            .config(test_config("node-1"))
+            .dial(at("relay-a"))
+            .sampler(BulkSampler::factory(4096))
+            .build()
+            .expect("the agent should build"),
+    );
+
+    let seen = collected.clone();
+    wait_for("a chunked batch to reach the global head", &mut || {
+        seen.count() > 0
+    })
+    .await;
+
+    assert_eq!(
+        collected.senders().first().map(String::as_str),
+        Some("node-1"),
+        "chunked or not, the producer is the producer"
+    );
+    assert_eq!(
+        collected.seen().first().map(String::len),
+        Some(4096),
+        "and it was reassembled whole after being re-split for the second hop"
+    );
+
+    agent.stop().await;
+    relay.stop().await;
     head.stop().await;
 }

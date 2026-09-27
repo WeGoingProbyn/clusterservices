@@ -18,10 +18,19 @@ pub(crate) enum Outgoing {
     /// Encoded service data, not yet framed — the writer decides how many frames
     /// it becomes, since only it knows the transport's ceiling.
     Data {
-        /// Which service produced it.
-        service: ServiceId,
+        /// The producing service's name.
+        ///
+        /// Owned, not the `&'static str` of a [`ServiceId`]: a batch being forwarded
+        /// upward carries a name that came off the wire, and leaking it to get a
+        /// `'static` would let a peer grow this process's memory by inventing service
+        /// names.
+        service: String,
+        /// The producing service's version.
+        version: u32,
         /// The plugin's encoded message.
         payload: Bytes,
+        /// The node that produced it, or empty when that is this engine.
+        origin: String,
     },
 }
 
@@ -125,6 +134,36 @@ impl PeerQueue {
     /// condition, not an error, and the drop is counted in
     /// [`EngineStats::data_dropped`](cs_api::EngineStats::data_dropped).
     pub(crate) fn push_data(&self, service: ServiceId, payload: Bytes) -> Result<()> {
+        self.push_data_from(service, payload, "")
+    }
+
+    /// Queue service data produced by another node, for a tier passing it upward.
+    ///
+    /// `origin` empty means this engine produced it. Dropping under pressure is the
+    /// same as for our own data: a relay under load sheds what it is carrying on the
+    /// same terms as what it makes, because pretending otherwise would just move the
+    /// loss somewhere less visible.
+    pub(crate) fn push_data_from(
+        &self,
+        service: ServiceId,
+        payload: Bytes,
+        origin: &str,
+    ) -> Result<()> {
+        self.push_data_owned(service.name, service.version, payload, origin)
+    }
+
+    /// Queue data for a service named by the wire rather than by a registration.
+    ///
+    /// What a forwarding tier uses: it has a `&str` from a frame, not the
+    /// `&'static str` of a [`ServiceId`], and turning one into the other would mean
+    /// leaking memory on a peer's say-so.
+    pub(crate) fn push_data_owned(
+        &self,
+        service: &str,
+        version: u32,
+        payload: Bytes,
+        origin: &str,
+    ) -> Result<()> {
         let mut inner = lock(&self.inner);
         if inner.closed || inner.aborted {
             return Err(closed_error());
@@ -136,7 +175,12 @@ impl PeerQueue {
                 .data_queue_depth
                 .fetch_sub(1, Ordering::Relaxed);
         }
-        inner.data.push_back(Outgoing::Data { service, payload });
+        inner.data.push_back(Outgoing::Data {
+            service: service.to_owned(),
+            version,
+            payload,
+            origin: origin.to_owned(),
+        });
         self.counters
             .data_queue_depth
             .fetch_add(1, Ordering::Relaxed);

@@ -1,0 +1,163 @@
+syntax = "proto3";
+
+// Per-job snapshots: what a head sends an aggregator when a step finishes.
+//
+// This is a **lossy and irreversible** summary. The raw samples are discarded once a
+// snapshot closes, so a statistic that is not in here cannot be recovered later — no
+// migration, no backfill, nothing. Everywhere else in this system a mistake costs a
+// rewrite; here it costs the data. Hence the generosity below: a histogram as well as
+// scalars, sums rather than means, and the counts needed to tell a missing number from
+// a zero one.
+//
+// Every statistic here **merges**. That is not a nicety: merging happens in three
+// places — across the nodes of a multi-node job, across a partial snapshot and the one
+// that follows it, and across reporting periods — and a median or a percentile cannot
+// be merged from summaries at all. That is why there are sums and a histogram rather
+// than a mean and a p95.
+package cs.snapshot.v1;
+
+// One step's usage on one node, over one period.
+//
+// Per *node*, deliberately. A multi-node job produces one of these per node, and
+// merging them into a job-level record is the aggregator's business: a head knows
+// exactly when its own node's cgroup went away and cannot know whether the job is over
+// elsewhere.
+message JobSnapshot {
+  // Slurm job id.
+  uint32 job_id = 1;
+  // The step, as it appears in the cgroup path without the `step_` prefix.
+  string step = 2;
+  // The user who owns the job, from the cgroup's owner.
+  uint32 uid = 3;
+  // The node this describes. Not the head that sent it — that is the `Data.origin`
+  // of the frame, and above a cluster the two together are what identifies a node,
+  // since `node-1` exists in every cluster.
+  string node = 4;
+
+  // First and last sample in this snapshot, milliseconds since the unix epoch.
+  //
+  // Wall clock, because a snapshot is read by something on another machine. The pair
+  // is the period the statistics cover, which is not the same as the job's runtime:
+  // a job that started before the head did has an earlier start than this says.
+  //
+  // Meaningful only when `samples` is non-zero. Zero is a real millisecond — 1970 —
+  // so it is **not** a sentinel for "unset", and code that treated it as one lost the
+  // start of any job whose first sample landed on the epoch.
+  uint64 first_unix_ms = 5;
+  uint64 last_unix_ms = 6;
+
+  // How many samples went into this, across every metric's own count.
+  uint64 samples = 7;
+
+  // Whether this covers the step to its end.
+  //
+  // True when the node said so — the agent marks its last batch final because the
+  // cgroup vanished. False when the head gave up waiting, which is what a powered-off
+  // node looks like: the statistics are real but the tail is missing, and a snapshot
+  // that hid the difference would make a truncated job look like a short one.
+  bool complete = 8;
+
+  // Why this snapshot was closed, for an operator looking at an incomplete one.
+  CloseReason closed_because = 9;
+
+  // One entry per metric the node reported, including the ones it could not read.
+  repeated MetricSummary metrics = 10;
+
+  // The histogram bucket boundaries every metric in this snapshot uses, as the upper
+  // bound of each bucket.
+  //
+  // Carried rather than implied by a version number: a reader that guessed wrong
+  // would silently mis-scale every distribution, and the cost of being explicit is a
+  // few dozen varints once per snapshot.
+  repeated uint64 bucket_bounds = 11;
+}
+
+// Why a snapshot stopped accumulating.
+enum CloseReason {
+  // Never sent; rejected on decode.
+  CLOSE_REASON_UNSPECIFIED = 0;
+  // The node reported its last batch: the cgroup is gone.
+  CLOSE_REASON_STEP_ENDED = 1;
+  // Nothing has been heard about this step for long enough to give up on it.
+  CLOSE_REASON_SILENT = 2;
+  // A periodic partial, sent so a long job's work is not lost if the head restarts.
+  // More will follow for the same step, and the aggregator merges them.
+  CLOSE_REASON_PERIODIC = 3;
+  // The head is shutting down and is flushing what it holds.
+  CLOSE_REASON_SHUTDOWN = 4;
+}
+
+// What one metric did over the period.
+//
+// For a **counter** every statistic below describes its *rate*, in units per second,
+// computed from the difference between consecutive samples — a counter's own values
+// are monotonic, so their minimum is the first sample and their maximum is the last,
+// and neither is worth recording. `total` carries the amount itself.
+//
+// For a **gauge** they describe the values, weighted by how long each one stood.
+message MetricSummary {
+  // Dotted name, as the plugin declares it: `cpu.usage_usec`, `memory.current`.
+  string metric = 1;
+  // Whether the statistics describe a rate or a level.
+  Kind kind = 2;
+
+  // How many samples were seen. **Zero means the metric was unavailable on this
+  // node** — not that it was zero, which is a different fact about a different
+  // kernel. Every other field is meaningless when this is 0.
+  uint64 samples = 3;
+
+  // The first and last raw values seen, whatever the kind.
+  //
+  // For a counter these give the amount consumed without any arithmetic: `total` is
+  // their difference, and keeping both means a reader can spot a reset the head
+  // reported. For a gauge they are the level at each end of the period.
+  uint64 first = 4;
+  uint64 last = 5;
+
+  // For a counter: how much it advanced, resets excluded. Zero for a gauge.
+  uint64 total = 6;
+
+  // The smallest and largest value seen — of the rate for a counter, of the level
+  // for a gauge.
+  double min = 7;
+  double max = 8;
+
+  // Weighted sum of the values, and the total weight, in seconds.
+  //
+  // The mean is `sum / weight`. Stored as a pair rather than as a mean because only
+  // the pair merges: averaging two means is wrong unless they covered equal time,
+  // and across nodes they never do.
+  double sum = 9;
+  double weight = 10;
+  // Weighted sum of squares, from which a standard deviation can be computed. Also
+  // stored this way because a standard deviation does not merge and this does.
+  double sum_squares = 11;
+
+  // Time spent in each occupied bucket, milliseconds, against the snapshot's
+  // `bucket_bounds`. Columnar and **sparse**: only the buckets that were occupied
+  // appear, which is what makes "time at less than 10% of a core" answerable without
+  // storing a slot for every bucket a metric never reached.
+  repeated uint32 bucket = 12;
+  repeated uint64 bucket_ms = 13;
+
+  // How many times a counter went backwards, which means something restarted.
+  //
+  // Those deltas are excluded from every statistic rather than recorded as enormous
+  // rates, so a non-zero count here is the only warning that `total` understates what
+  // actually happened.
+  uint32 resets = 14;
+
+  // Samples skipped because the batch's columns did not line up with its timestamps.
+  // Non-zero means a peer sent a malformed batch and is worth an operator's attention.
+  uint32 discarded = 15;
+}
+
+// Whether a summary describes a rate or a level. Mirrors `cs_api::MetricKind`.
+enum Kind {
+  // Never sent; rejected on decode.
+  KIND_UNSPECIFIED = 0;
+  // Statistics describe the rate of a cumulative series, per second.
+  KIND_COUNTER = 1;
+  // Statistics describe the values of a level, weighted by time.
+  KIND_GAUGE = 2;
+}

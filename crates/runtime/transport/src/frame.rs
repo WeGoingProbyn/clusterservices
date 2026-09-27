@@ -223,13 +223,18 @@ impl fmt::Display for Frame {
         match self {
             Self::Data(data) => write!(
                 f,
-                "data {}/v{} {}B{}",
+                "data {}/v{} {}B{}{}",
                 data.service,
                 data.service_version,
                 data.payload.len(),
                 match data.chunk {
                     Some(chunk) => format!(" chunk {}/{}", chunk.index + 1, chunk.count),
                     None => String::new(),
+                },
+                if data.origin.is_empty() {
+                    String::new()
+                } else {
+                    format!(" from {}", data.origin)
                 }
             ),
             Self::Hello(hello) => write!(
@@ -267,6 +272,13 @@ pub struct DataFrame {
     pub chunk: Option<Chunk>,
     /// The plugin's encoded message. Opaque here.
     pub payload: Bytes,
+    /// The node that **produced** this, when that is not the peer sending it.
+    ///
+    /// Empty on the hop from the node that measured it — the connection already
+    /// says who that was, and a second answer could only disagree. Set by the first
+    /// tier that forwards data upward and preserved unchanged above it, which is
+    /// what stops a cluster head crediting a whole rack's metrics to one relay.
+    pub origin: String,
 }
 
 impl DataFrame {
@@ -278,6 +290,7 @@ impl DataFrame {
             service_version,
             chunk: None,
             payload,
+            origin: String::new(),
         }
     }
 
@@ -294,6 +307,30 @@ impl DataFrame {
             service_version,
             chunk: Some(chunk),
             payload,
+            origin: String::new(),
+        }
+    }
+
+    /// Say which node produced this, for a tier passing it upward.
+    ///
+    /// Leave it unset when sending data this engine measured itself: the peer on the
+    /// other end of the connection knows who we are.
+    #[must_use]
+    pub fn produced_by(mut self, origin: impl Into<String>) -> Self {
+        self.origin = origin.into();
+        self
+    }
+
+    /// Who produced this, given the peer it arrived from.
+    ///
+    /// The whole point of the field: `via` is who handed it over, and this is who
+    /// measured it. They differ only once something has forwarded it.
+    #[must_use]
+    pub fn producer<'a>(&'a self, via: &'a str) -> &'a str {
+        if self.origin.is_empty() {
+            via
+        } else {
+            &self.origin
         }
     }
 
@@ -306,15 +343,23 @@ impl DataFrame {
     /// exceeds `max_frame`, which means the transport's limit is unusably small
     /// for this service.
     #[must_use]
-    pub fn max_payload(max_frame: usize, service: &str, chunk: Option<Chunk>) -> usize {
+    pub fn max_payload(
+        max_frame: usize,
+        service: &str,
+        origin: &str,
+        chunk: Option<Chunk>,
+    ) -> usize {
         // Everything except the payload field. Worst case on the version, since a
-        // varint is widest at its largest value and the engine may use any.
+        // varint is widest at its largest value and the engine may use any. The
+        // origin is in here because a forwarding tier's frames carry it and it is
+        // as much a part of the envelope as the service name.
         let base = prost::Message::encoded_len(
             &Self {
                 service: service.to_owned(),
                 service_version: u32::MAX,
                 chunk,
                 payload: Bytes::new(),
+                origin: origin.to_owned(),
             }
             .into_proto(),
         );
@@ -349,6 +394,7 @@ impl DataFrame {
             message_id,
             chunk_index,
             chunk_count,
+            origin: self.origin,
         }
     }
 
@@ -376,6 +422,7 @@ impl DataFrame {
             service_version: data.service_version,
             chunk,
             payload: data.payload,
+            origin: data.origin,
         })
     }
 }
@@ -385,7 +432,8 @@ impl DataFrame {
 ///
 /// Three nested costs: the payload's own field (tag, length delimiter, bytes),
 /// the `Data` message's length delimiter inside the `Frame`, and the `Frame`'s
-/// oneof tag. Field numbers 1..=6 keep every tag to a single byte.
+/// oneof tag. Field numbers 1..=15 keep every tag to a single byte, which is why
+/// `Data` has room to grow before this arithmetic changes shape.
 fn frame_len_for_payload(base: usize, payload: usize) -> usize {
     let data_len = if payload == 0 {
         // prost omits an empty `bytes` field entirely: it is the proto3 default.
@@ -1779,54 +1827,129 @@ mod tests {
         assert!(err.to_string().contains("carries no error"));
     }
 
+    /// Attribution has to survive the wire, or a relay is useless.
+    #[test]
+    fn a_forwarded_data_frame_keeps_its_producer() {
+        let frame = Frame::Data(
+            DataFrame::new("cgroup", 1, Bytes::from_static(b"batch")).produced_by("node-1"),
+        );
+        let decoded = round_trip(frame.clone());
+        assert_eq!(decoded, frame);
+
+        let Frame::Data(data) = decoded else {
+            panic!("expected data");
+        };
+        assert_eq!(data.origin, "node-1");
+        assert_eq!(
+            data.producer("relay-a"),
+            "node-1",
+            "the producer is the origin once something has forwarded it"
+        );
+        assert!(frame.to_string().contains("from node-1"), "{frame}");
+    }
+
+    /// The common case, and the reason the field is empty rather than always set:
+    /// on the hop from the node that measured it, the connection already says who.
+    #[test]
+    fn an_unforwarded_data_frame_names_no_producer() {
+        let Frame::Data(data) = round_trip(Frame::Data(DataFrame::new(
+            "cgroup",
+            1,
+            Bytes::from_static(b"batch"),
+        ))) else {
+            panic!("expected data");
+        };
+        assert!(data.origin.is_empty());
+        assert_eq!(
+            data.producer("node-1"),
+            "node-1",
+            "with no origin, whoever handed it over is who measured it"
+        );
+    }
+
     // --- chunking arithmetic ---
 
     #[test]
     fn max_payload_leaves_room_for_the_envelope() {
+        // Every axis that moves the envelope: the frame ceiling, the chunk numbers'
+        // varint widths, and — since a forwarding tier sets it — the origin.
         for max_frame in [64usize, 256, 1024, 64 * 1024, 4 * 1024 * 1024] {
             for chunk in [None, Some(Chunk::new(u64::MAX, 1, u32::MAX))] {
-                let limit = DataFrame::max_payload(max_frame, "cgroup", chunk);
-                assert!(limit > 0, "no room at all in {max_frame}");
+                for origin in ["", "node-1", "cluster-a/node-1024.some.long.domain"] {
+                    let limit = DataFrame::max_payload(max_frame, "cgroup", origin, chunk);
 
-                let exact = Frame::Data(DataFrame {
-                    service: "cgroup".into(),
-                    service_version: u32::MAX,
-                    chunk,
-                    payload: Bytes::from(vec![0u8; limit]),
-                })
-                .encoded_len();
-                assert!(
-                    exact <= max_frame,
-                    "a max-size payload encoded to {exact} > {max_frame}"
-                );
+                    let frame = |bytes: usize| {
+                        Frame::Data(DataFrame {
+                            service: "cgroup".into(),
+                            service_version: u32::MAX,
+                            chunk,
+                            payload: Bytes::from(vec![0u8; bytes]),
+                            origin: origin.to_owned(),
+                        })
+                        .encoded_len()
+                    };
 
-                let over = Frame::Data(DataFrame {
-                    service: "cgroup".into(),
-                    service_version: u32::MAX,
-                    chunk,
-                    payload: Bytes::from(vec![0u8; limit + 1]),
-                })
-                .encoded_len();
-                assert!(
-                    over > max_frame,
-                    "one more byte still fit: {over} <= {max_frame}, so the limit is not tight"
-                );
+                    // Zero is a real answer, not a failure: a 64-byte ceiling cannot
+                    // hold a long origin *and* worst-case chunk numbers. Assert that
+                    // it is the *right* answer rather than tolerating it.
+                    if limit == 0 {
+                        let empty = frame(0);
+                        assert!(
+                            empty > max_frame,
+                            "said there was no room, but an empty payload fits: \
+                             {empty} <= {max_frame} ({origin:?})"
+                        );
+                        continue;
+                    }
+
+                    let exact = frame(limit);
+                    assert!(
+                        exact <= max_frame,
+                        "a max-size payload encoded to {exact} > {max_frame} ({origin:?})"
+                    );
+                    let over = frame(limit + 1);
+                    assert!(
+                        over > max_frame,
+                        "one more byte still fit: {over} <= {max_frame}, so the limit is \
+                         not tight ({origin:?})"
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn max_payload_is_zero_when_the_envelope_alone_does_not_fit() {
-        assert_eq!(DataFrame::max_payload(2, "a-long-service-name", None), 0);
-        assert_eq!(DataFrame::max_payload(0, "s", None), 0);
+        assert_eq!(
+            DataFrame::max_payload(2, "a-long-service-name", "", None),
+            0
+        );
+        assert_eq!(DataFrame::max_payload(0, "s", "", None), 0);
+        // And an origin can be what tips it over.
+        assert_eq!(
+            DataFrame::max_payload(12, "s", "a-node-with-a-long-name", None),
+            0
+        );
     }
 
     #[test]
     fn a_longer_service_name_leaves_less_room() {
-        let short = DataFrame::max_payload(1024, "cpu", None);
-        let long = DataFrame::max_payload(1024, "cgroup-memory", None);
+        let short = DataFrame::max_payload(1024, "cpu", "", None);
+        let long = DataFrame::max_payload(1024, "cgroup-memory", "", None);
         assert!(long < short);
         assert_eq!(short - long, "cgroup-memory".len() - "cpu".len());
+    }
+
+    /// The reason `max_payload` had to grow a parameter: a forwarded frame carries
+    /// the producer's name, and chunking against the unforwarded size would build
+    /// frames the transport then refuses.
+    #[test]
+    fn an_origin_leaves_less_room_too() {
+        let direct = DataFrame::max_payload(1024, "cgroup", "", None);
+        let forwarded = DataFrame::max_payload(1024, "cgroup", "node-17", None);
+        assert!(forwarded < direct);
+        // Tag and length byte, plus the name itself.
+        assert_eq!(direct - forwarded, "node-17".len() + 2);
     }
 
     #[test]

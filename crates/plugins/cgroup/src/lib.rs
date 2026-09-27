@@ -51,6 +51,8 @@ mod sampler;
 #[cfg(any(test, feature = "test-util"))]
 pub mod testing;
 
+mod metrics;
+
 /// The wire schema, generated from `proto/cgroup.proto`.
 pub mod proto {
     #![allow(missing_docs)]

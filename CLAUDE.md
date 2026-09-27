@@ -128,6 +128,12 @@ crates/
                                   **CPU per thread name** — which is what the
                                   `<service>/<worker>` convention was for. Plus
                                   `FakeProc` behind `test-util`. DONE.
+    snapshot/      cs-plugin-snapshot  Per-job snapshots: folds any plugin's batch
+                                  (through `cs_api::Metrics`) into mergeable
+                                  summaries, closes one per (node, job, step), and
+                                  sends them upward as an ordinary service. Also
+                                  `merge`, which is the aggregator's core operation.
+                                  Names no plugin. DONE.
     gpu/           cs-plugin-gpu      (later)
 apps/
   agent/           cs-agent       binary: dials a head and registers samplers.
@@ -226,6 +232,18 @@ pub enum Never {}
 pub type NoCommand = Never;
 pub type NoData = Never;
 
+// Where counter-vs-gauge is declared: in the plugin, in code, next to the fields it
+// describes — **not** in the protocol. Putting it on the wire would mean versioning
+// every plugin's semantics alongside the frame format, and a summariser that could
+// not tell the two apart would be wrong about half a fleet's metrics.
+pub enum MetricKind { Counter, Gauge }
+pub struct Series<'a> { name: &'static str, kind: MetricKind, values: &'a [u64] }
+pub trait Metrics {
+    fn timestamps(&self) -> &[u64];             // wall clock: a reader is elsewhere
+    fn series(&self) -> Vec<Series<'_>>;        // including the unavailable ones
+    fn columns_line_up(&self) -> bool { .. }    // check before indexing anything
+}
+
 pub enum Command<C> { Shutdown, Restart, Custom(C) }
 pub enum Reply { Default, Handled, Rejected(String) }
 
@@ -315,6 +333,12 @@ pub enum Frame {
     StatusReport(StatusReport),    // this, and how long I have been up
 }
 
+// `DataFrame.origin`: which node **produced** this, when that is not the peer
+// sending it. Empty on the hop from the node that measured it — the connection
+// already says who that was. Set by the first tier that forwards and preserved
+// unchanged above it, which is what stops a head crediting a rack to one relay.
+// `data.producer(via)` resolves the two into one answer.
+
 // `CommandFrame.node`: which node this is for, when that is not the peer being
 // sent to. Empty on the server -> agent hop (the connection already says which
 // node, and a second answer could only disagree); set by an operator, whose one
@@ -349,8 +373,17 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
 ## Behavioural contracts
 
 **Envelope / routing**
-- Services are routed by `ServiceDef::NAME` string. Unknown service on receipt:
-  log, count, drop. Never kill the connection.
+- Two samplers, or two handlers, with one service name are rejected at build time —
+  but **a sampler and a handler may share one**, and a cluster head does exactly that
+  with `selfmon`: reporting on itself upward while reading what its own nodes report.
+  They are opposite directions through one name. Rejecting the pair made a three-tier
+  deployment refuse to start.
+- Services are routed by `ServiceDef::NAME` string. A service with no handler is
+  **passed to the tier above if there is one**, counted in `data_forwarded`, and
+  otherwise logged, counted in `unroutable_frames` and dropped. Never kill the
+  connection either way. That one rule is the whole of what makes a relay carry data:
+  a middle tier is one with somewhere to pass things, so there is no "forward" switch
+  in the engine and a relay is configured by *not* registering handlers.
 - Node name is sent once in `Hello`, along with the agent's service list (lets
   the server reject commands for services a node doesn't run).
 - Two lanes: **control** (commands, results, heartbeats, hello/goodbye) is
@@ -358,10 +391,16 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
   (`Capabilities::native_lanes`); otherwise the engine interleaves in `Lane`
   order.
 - Engine chunks payloads above `Capabilities::max_frame`, sizing each chunk with
-  `DataFrame::max_payload(max_frame, service, chunk)`. That figure is not a
-  constant and must not be hand-derived: the service name's length and the
-  varint widths of the chunk numbers both move it, and a larger payload can
-  widen the length delimiter of the `Data` message enclosing it.
+  `DataFrame::max_payload(max_frame, service, origin, chunk)`. That figure is not a
+  constant and must not be hand-derived: the service name's length, **the origin's
+  length**, and the varint widths of the chunk numbers all move it, and a larger
+  payload can widen the length delimiter of the `Data` message enclosing it. A
+  forwarded frame carries the producer's name in *every* chunk, so a ceiling that
+  carried a service's data unforwarded may not carry it onward — `split` says so by
+  name when that happens.
+- `Data.origin` must be the same on every chunk of one message, and reassembly
+  **rejects** a message whose chunks disagree. Taking the first chunk's answer would
+  let a peer smuggle data in under another node's name.
 - The frame protocol is validated on decode, not trusted: a missing body, an
   `_UNSPECIFIED` or unrecognised enum member, an empty node/service name, a zero
   command id, a chunk index past its count, and a `Failed` outcome with no
@@ -493,12 +532,19 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
   that serves it, and the in-flight entry is keyed on **the child** — so a child that
   disconnects abandons it rather than leaving it waiting for a node it can no longer
   reach.
-- What is **not** built: a relay cannot forward *data* upward. A batch for a service
-  it has no handler for is counted and dropped, as before. That needs `Data.origin`
-  (additive) and the chunk-size arithmetic to account for it, plus a decision about
-  whether a middle tier forwards or aggregates. Until then a relay carries commands
-  and reachability only, and `Origin { node, via }` in cs-api is ready for the day it
-  carries data.
+- **Data crosses a tier too.** A batch for a service this engine has no handler for
+  goes to the tier above with `Data.origin` set to whoever produced it, so a handler
+  three tiers up sees `from.node == "node-1"` and `from.via == "relay-a"`. The policy
+  question "does a middle tier forward or aggregate?" is answered by which handlers it
+  registers: none means forward everything, and a head that registers a handler
+  consumes what it can read. Verified over TCP through a real relay, not just the mock.
+- **A tier in the middle reports on itself upward**, through the ordinary selfmon
+  plugin on the ordinary terms — batched, chunked, queued, dropped under pressure.
+  `cs-server --upstream` registers the sampler for exactly this reason: a relay with
+  no sampler is a relay nobody can see, and `data_forwarded` would be a counter with
+  no reader.
+- `data_forwarded` is counted **separately from** `unroutable_frames`, because
+  forwarded and dropped are different outcomes and must not look alike in a graph.
 
 **Status**
 - `Status`/`StatusReport` answer "who is connected, and what do they run", from the
@@ -513,6 +559,56 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
   an operator and the tier above. From a compute node it is counted and dropped — it
   has no use for the cluster's inventory, and a peer that can route commands could
   discover the same list by trying them.
+
+**Snapshots**
+- A head keeps a running summary of every step its nodes report and sends **one
+  snapshot per (node, job, step)** upward when the step ends. Raw samples stay at the
+  head and are discarded. That ratio is the whole point: full samples for ten thousand
+  nodes are ~120k values/s, snapshots are ~1M rows/*day*.
+- **Per node, not per job.** A head knows exactly when its own node's cgroup went away
+  and cannot know whether the job is still running elsewhere. Merging a multi-node
+  job's snapshots is the aggregator's business, so the head never has to infer
+  something it cannot see.
+- **A snapshot is irreversible.** Once one closes the samples behind it are gone: no
+  migration recovers a statistic that was not computed. So it records generously — a
+  histogram as well as scalars, and counts that distinguish "unavailable" from "zero".
+  Everywhere else in this system a mistake costs a rewrite; here it costs the data.
+- **Every statistic merges**, because merging happens in three places: across the nodes
+  of a multi-node job, across a partial snapshot and its successor, and across periods.
+  A percentile cannot be merged from summaries — so sums, counts, min/max and a
+  histogram are stored, and the mean, standard deviation and quantiles are derived on
+  read. `cs_plugin_snapshot::merge` is that operation, and the test that matters is
+  "pieces merged equal the whole accumulated".
+- A **counter** is summarised by its *rate* (per second, from consecutive deltas), a
+  **gauge** by its values *weighted by how long each stood* — an interval that slips
+  would otherwise let a dense stretch outvote a sparse one. A counter going backwards
+  is a reset: the delta is discarded, not recorded as an enormous rate, and `resets`
+  counts it so a reader knows `total` understates the truth.
+- The histogram is **log-scaled, sparse, and carries its own bounds**. One boundary set
+  serves CPU rates and terabytes alike; only occupied buckets are stored; and the bounds
+  travel in the snapshot rather than being implied by a version, because a reader that
+  guessed wrong would silently mis-scale every distribution.
+- **`CgroupBatch.final` makes a step's end observed rather than inferred.** The agent
+  flushed *because* the cgroup vanished, so it says so, and the head closes that
+  snapshot at once. A `final` batch is sent **even when it carries no samples** — a job
+  that ends just after its window closed has nothing new to report, and staying silent
+  would leave the head to notice silence minutes later and record the step as
+  incomplete. That is not a rare case: it is one window in every job's lifetime, and it
+  was found by running a job end to end rather than by any test.
+- The silence timeout remains the fallback, for the nodes that actually died — they send
+  no final batch either. A snapshot closed that way is **`complete: false`**, because a
+  truncated job must not read like a short one.
+- Periodic partials (default 10 min) are insurance against losing a week-long job to a
+  head restart; each covers only what happened since the last, so an aggregator adds
+  them rather than deduplicating them.
+- **Zero is a real timestamp**, so `first_unix_ms == 0` is not a sentinel for "unset" —
+  `samples` is. Treating zero as absent lost the start of a job whose first sample
+  landed on the epoch, and it was written twice before a test with a batch starting at
+  zero caught it.
+- Snapshots travel as an **ordinary service** on the ordinary terms: a `Snapshots`
+  handle shared between the handler that folds and a `SnapshotSampler` that sweeps.
+  A privileged path would mean the numbers describing a cluster travelled differently
+  from the cluster's own metrics — the same argument that keeps `selfmon` a plugin.
 
 **Liveness**
 - Heartbeats go out on the control lane when a connection has been idle for
@@ -567,7 +663,12 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
   the exit status systemd matches with `RestartForceExitStatus=`.
 
 **Metrics conventions**
-- Send cumulative counters, not rates; server computes rates.
+- Attribute data to `Origin::node`, never to `Origin::via`. They are equal in a
+  two-tier deployment and differ the day a relay appears; a handler written against
+  the wrong one silently credits a whole rack to the relay in front of it.
+- Send cumulative counters, not rates; server computes rates. **Which is which is
+  declared by the plugin** through `cs_api::Metrics`, since only the plugin knows
+  whether a field came from `cpu.stat` or `memory.current`.
 - Sample every few seconds, batch and send every 30–60s.
 - Batches are columnar (one timestamp array, one value array per metric).
 - **An empty series means the metric is unavailable, never that it is zero.** A
@@ -643,9 +744,9 @@ them all:
     agents      agents           agents
 ```
 
-**This works now, for commands.** Every middle tier is an engine in both roles —
-`listen` for the tier below, `dial` for the tier above — and two of the three things
-that had to exist for a tier to be crossed have been built:
+**This works now.** Every middle tier is an engine in both roles — `listen` for the
+tier below, `dial` for the tier above — and all three of the things that had to exist
+for a tier to be crossed have been built:
 
 1. ~~**`Hello` advertises only the peer's own services.**~~ Done: `Reachable`
    announcements, the full set each time, coalesced, with a `node → child` table
@@ -654,18 +755,13 @@ that had to exist for a tier to be crossed have been built:
    same code that carries an operator's command, which is why the two arrived
    together. `cs-ctl status` at a global head lists nodes it has never spoken to, and
    `cs-ctl restart -n node-1` from there reaches a node two tiers down.
-3. **Data carries no origin.** Still true, and now the only gap. `Data` has
-   `service`, `service_version` and `payload`; who produced it is implicit in which
-   connection it arrived on, which is correct with two tiers and wrong with three — a
-   relay forwarding upward would have the head attribute every agent's metrics to the
-   relay. Needs a `Data.origin` field (additive), set by the first tier that forwards;
-   `Origin { node, via }` in cs-api is already the shape a handler sees.
-
-   Two things make it more than adding a field. `DataFrame::max_payload` decides the
-   chunk size and would have to account for the origin's length — that figure must not
-   be hand-derived. And there is a policy question a field does not answer: does a
-   middle tier forward a batch it has no handler for, or aggregate it? Today it counts
-   and drops it, which is at least visible rather than wrong. **The one thing that was not additive has been done**: `Origin` in `cs-api`
+3. ~~**Data carries no origin.**~~ Done: `Data.origin`, set by the first tier that
+   forwards and preserved above it. The two things that made it more than adding a
+   field were both real — `DataFrame::max_payload` now takes the origin, because a
+   forwarded frame carries the producer's name in every chunk; and the policy question
+   ("does a middle tier forward or aggregate?") is answered by which handlers it
+   registers rather than by a switch. A relay is `cs-server --upstream X --relay`,
+   which registers none. **The one thing that was not additive has been done**: `Origin` in `cs-api`
 now distinguishes `node` (who produced this) from `via` (who delivered it). That
 is a plugin-facing *semantic*, and a handler written against "`node` is who I am
 talking to" would silently attribute a whole rack to a relay the day one appeared.
@@ -876,10 +972,15 @@ transport** first, then run the **same suite** against TCP.
    Not built: custom commands from the CLI — a plugin's payload is its own type, so a
    generic tool can only carry bytes it cannot construct; that wants a per-plugin
    subcommand or a `--payload @file` escape hatch.
-9. ~~Reachability announcements and the routing table~~ — a relay carries commands and
-   answers `status` for nodes behind it. ← **`Data.origin` is what is left** before a
-   relay can carry metrics too.
-10. Later: gRPC transport, eBPF network plugin, RDMA transport.
+9. ~~The relay tier~~: reachability announcements, the routing table, `status`, and
+   ~~`Data.origin`~~ so metrics keep their producer across a hop. A relay is
+   `cs-server --upstream X --relay`. Done, over the mock and over TCP.
+10. ~~Per-job snapshots~~: `cs-plugin-snapshot`, closed per (node, job, step) on the
+   node's own word, merged by the aggregator. Verified with a whole fake job through
+   three tiers — `cpu 8.000s (mean 0.67, peak 1.33) mem 300.0MiB (kernel peak) ended`.
+   ← **The aggregator next**: the store (`standalone/`, Postgres, narrow schema), a job
+   record joined from Slurm, and opt-in raw streaming for a job that asks for it.
+11. Later: gRPC transport, eBPF network plugin, RDMA transport.
 
 ## What a binary owns
 
@@ -942,6 +1043,25 @@ indistinguishable), `TimeoutStopSec=20s` against the engine's own 10s deadline,
 `Slice=system.slice` so an agent is never under `slurmstepd.scope` looking like a
 job, and `After=slurmd.service` without `Requires=`, because an agent that starts
 early finds no jobs and says so while one that refuses to start is simply absent.
+
+### Running three tiers
+
+```sh
+cs-server -l tcp://0.0.0.0:7777 -n global                                  # the top
+cs-server -l tcp://0.0.0.0:7777 -n relay-a --upstream tcp://global:7777 --relay
+cs-agent  --server tcp://relay-a:7777 -n node-1
+```
+
+`--relay` registers no handlers, which is the whole configuration: the engine passes
+on what it cannot read. Observed at the global head, which has never spoken to node-1:
+
+```
+node-1  selfmon  4 samples  agent cpu +1.810s rss 26.7MiB  …  [burn/spin0 +1.800s]
+relay-a selfmon  3 samples  agent cpu +10.0ms  rss 8.7MiB   …  relayed 3
+```
+
+The first line is node-1's own metrics, attributed to node-1. The second is the relay
+reporting on itself, including how much it has passed on.
 
 ### Operating a running cluster
 

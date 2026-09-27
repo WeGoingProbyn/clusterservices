@@ -190,7 +190,9 @@ impl CgroupSampler {
             .collect();
         for key in vanished {
             if let Some(accumulator) = self.open.remove(&key) {
-                ready.extend(finish(accumulator));
+                // The cgroup is gone: this is everything anyone will ever get for
+                // that step, and the batch says so.
+                ready.extend(finish(accumulator, true));
             }
         }
 
@@ -248,7 +250,8 @@ impl CgroupSampler {
                         opened: now,
                     },
                 );
-                ready.extend(finish(done));
+                // The window closed, not the job: more batches are coming.
+                ready.extend(finish(done, false));
             }
         }
 
@@ -264,7 +267,10 @@ impl CgroupSampler {
     fn flush_all(&mut self) -> Vec<CgroupBatch> {
         self.open
             .drain()
-            .filter_map(|(_, accumulator)| finish(accumulator))
+            // Not final: the agent is stopping, the jobs are not. Marking these as
+            // last batches would close out snapshots for every running job on the
+            // node every time the agent restarts.
+            .filter_map(|(_, accumulator)| finish(accumulator, false))
             .collect()
     }
 }
@@ -276,13 +282,23 @@ impl Default for CgroupSampler {
 }
 
 /// Turn an accumulator into a batch, or nothing if it holds no samples.
-fn finish(accumulator: Accumulator) -> Option<CgroupBatch> {
-    if accumulator.samples.is_empty() {
+///
+/// `ended` marks the batch as the step's last: set when the cgroup has gone, not
+/// merely when the window has closed. A server uses it to close out a job's snapshot
+/// without waiting to notice silence.
+fn finish(accumulator: Accumulator, ended: bool) -> Option<CgroupBatch> {
+    // An empty batch is worth sending when — and only when — it carries the news that
+    // the step is over. A job that ends just after its window closed has nothing left
+    // to report, and staying silent would leave the server to work out that the step
+    // ended by waiting for a timeout: minutes later, and marked incomplete. That case
+    // is not rare, it is one window in every job's lifetime.
+    if accumulator.samples.is_empty() && !ended {
         return None;
     }
     let samples = &accumulator.samples;
 
     Some(CgroupBatch {
+        r#final: ended,
         job: Some(JobRef {
             job_id: accumulator.job.job_id,
             step: accumulator.job.step.to_string(),
@@ -419,4 +435,67 @@ fn unix_millis() -> Result<u64> {
                 err,
             )
         })
+}
+
+#[cfg(test)]
+mod final_batch_tests {
+    use super::*;
+    use crate::testing::FakeCgroups;
+    use cs_api::test_support::FakeEngine;
+    use cs_api::{JobSource, StepId};
+
+    /// The important sequence, and the one a mock-only test would not have found: a
+    /// window closes, and *then* the job ends with nothing new to report. Without a
+    /// final batch here the server waits out its silence timeout and records the step
+    /// as incomplete, minutes late, for every job that happens to finish just after a
+    /// flush — which is one window in every job's life.
+    #[test]
+    fn a_job_that_ends_just_after_a_flush_still_says_so() {
+        let cgroups = FakeCgroups::new();
+        let job = cgroups.add_job(42, StepId::Index(0), 1000);
+        let engine = FakeEngine::new("node-1");
+
+        let mut sampler = CgroupSampler::with_config(
+            CgroupConfig::new()
+                .every(Duration::from_secs(1))
+                .batching_for(Duration::from_secs(2)),
+        );
+        sampler
+            .start(&engine.ctx::<CgroupService>())
+            .expect("start");
+
+        let source = cgroups.jobs();
+        let jobs = source.jobs().expect("scan");
+        // Two samples fill the window, which flushes.
+        cgroups.write(&job, "cpu.stat", "usage_usec 1000000\n");
+        let first = sampler
+            .tick(&jobs, Duration::from_secs(1), 1000)
+            .expect("tick");
+        cgroups.write(&job, "cpu.stat", "usage_usec 2000000\n");
+        let second = sampler
+            .tick(&jobs, Duration::from_secs(3), 3000)
+            .expect("tick");
+        assert!(
+            !first.is_empty() || !second.is_empty(),
+            "the window should have produced a batch by now"
+        );
+        assert!(
+            first.iter().chain(&second).all(|batch| !batch.r#final),
+            "the job is still running"
+        );
+
+        // Now it ends, with nothing accumulated since the flush.
+        cgroups.remove_job(&job);
+        let last = sampler
+            .tick(&source.jobs().expect("scan"), Duration::from_secs(4), 4000)
+            .expect("tick");
+
+        assert_eq!(last.len(), 1, "the end of a step is news even when empty");
+        assert!(last[0].r#final, "and it has to be marked as the last");
+        assert_eq!(
+            last[0].job.as_ref().map(|job| job.job_id),
+            Some(42),
+            "with enough identity to close the right snapshot"
+        );
+    }
 }

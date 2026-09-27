@@ -200,7 +200,7 @@ pub async fn every_frame_kind_survives<T: TestTransport>(fixture: T) {
 /// A payload right at the transport's frame ceiling still goes through.
 pub async fn a_frame_at_the_ceiling_is_carried<T: TestTransport>(fixture: T) {
     let max_frame = fixture.transport().capabilities().max_frame;
-    let limit = DataFrame::max_payload(max_frame, "counter", None);
+    let limit = DataFrame::max_payload(max_frame, "counter", "", None);
     assert!(limit > 0, "a transport must carry at least some payload");
 
     let ((mut tx, _), (_, mut rx)) = pair(&fixture).await;
@@ -379,7 +379,7 @@ pub async fn capabilities_are_sane<T: TestTransport>(fixture: T) {
         capabilities.max_frame
     );
     // The engine sizes chunks against this, so it has to admit a payload.
-    assert!(DataFrame::max_payload(capabilities.max_frame, "counter", None) > 0);
+    assert!(DataFrame::max_payload(capabilities.max_frame, "counter", "", None) > 0);
 }
 
 /// A sender stops accepting frames once the peer stops reading.

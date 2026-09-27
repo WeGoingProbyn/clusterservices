@@ -28,6 +28,7 @@ pub(crate) struct Counters {
     pub(crate) control_queue_depth: AtomicU64,
     pub(crate) data_dropped: AtomicU64,
     pub(crate) unroutable_frames: AtomicU64,
+    pub(crate) data_forwarded: AtomicU64,
     pub(crate) commands_completed: AtomicU64,
     pub(crate) commands_expired: AtomicU64,
     pub(crate) command_rtt_total_ms: AtomicU64,
@@ -143,6 +144,7 @@ impl Counters {
             control_queue_depth: self.control_queue_depth.load(Ordering::Relaxed),
             data_dropped: self.data_dropped.load(Ordering::Relaxed),
             unroutable_frames: self.unroutable_frames.load(Ordering::Relaxed),
+            data_forwarded: self.data_forwarded.load(Ordering::Relaxed),
             commands_completed: self.commands_completed.load(Ordering::Relaxed),
             commands_expired: self.commands_expired.load(Ordering::Relaxed),
             command_rtt_total: Duration::from_millis(

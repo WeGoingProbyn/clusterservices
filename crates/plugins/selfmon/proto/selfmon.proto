@@ -27,6 +27,9 @@ message SelfmonBatch {
   // reconnect after a clean close is ordinary, a timeout means a peer stopped
   // answering without saying so.
   repeated uint64 peer_timeouts = 22;
+  // Messages this engine could not read and passed to the tier above instead.
+  // Non-zero on a relay, and on nothing else.
+  repeated uint64 data_forwarded = 23;
   // Peers connected right now. 0 or 1 on an agent.
   repeated uint64 peers = 15;
   repeated uint64 data_queue_depth = 16;

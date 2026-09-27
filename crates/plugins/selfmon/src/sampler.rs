@@ -253,6 +253,7 @@ fn build(held: &[Snapshot]) -> SelfmonBatch {
         control_queue_depth: engine_series(held, |e| e.control_queue_depth),
         data_dropped: engine_series(held, |e| e.data_dropped),
         unroutable_frames: engine_series(held, |e| e.unroutable_frames),
+        data_forwarded: engine_series(held, |e| e.data_forwarded),
         commands_completed: engine_series(held, |e| e.commands_completed),
         commands_expired: engine_series(held, |e| e.commands_expired),
 

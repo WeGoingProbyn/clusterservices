@@ -71,6 +71,15 @@ message CgroupBatch {
   repeated uint64 memory_pressure_full_usec = 52;
   repeated uint64 io_pressure_some_usec = 53;
   repeated uint64 io_pressure_full_usec = 54;
+
+  // The last batch for this step: its cgroup is gone, so there will be no more.
+  //
+  // The agent knows this for certain — it flushed *because* the cgroup vanished —
+  // and saying so turns a job's end from something a server has to infer from
+  // silence into something it is told. A server still needs the timeout as a
+  // fallback, because a node that loses power sends no final batch either; but it
+  // only needs it for the nodes that actually died.
+  bool final = 60;
 }
 
 // Which job step a batch describes.
