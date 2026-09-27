@@ -1,6 +1,6 @@
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use cs_transport::Endpoint;
@@ -92,6 +92,9 @@ struct LinkInner {
     /// Weak so that holding a `Link` does not keep a direction's channel open:
     /// a dropped sending half must still look dropped to the reader.
     senders: [mpsc::WeakSender<Wire>; 2],
+    /// Set when a direction silently discards everything, modelling a half-open
+    /// connection.
+    blackholed: [AtomicBool; 2],
     frames_sent: [AtomicU64; 2],
     frames_received: [AtomicU64; 2],
     bytes_sent: [AtomicU64; 2],
@@ -115,6 +118,7 @@ impl Link {
             server,
             killed,
             senders: [to_server_tx.downgrade(), to_client_tx.downgrade()],
+            blackholed: [AtomicBool::new(false), AtomicBool::new(false)],
             frames_sent: [AtomicU64::new(0), AtomicU64::new(0)],
             frames_received: [AtomicU64::new(0), AtomicU64::new(0)],
             bytes_sent: [AtomicU64::new(0), AtomicU64::new(0)],
@@ -168,6 +172,31 @@ impl Link {
     #[must_use]
     pub fn is_alive(&self) -> bool {
         !*self.inner.killed.borrow()
+    }
+
+    /// Silently discard everything sent in one direction, leaving the link up.
+    ///
+    /// **The failure a monitoring system has to survive and cannot detect from the
+    /// socket:** a node loses power. There is no FIN and no RST, because nothing is
+    /// left to send one. Writes keep succeeding into the void and reads simply never
+    /// return. TCP notices after its keepalive interval, which defaults to a
+    /// couple of hours.
+    ///
+    /// Frames are still counted as sent, because the sender genuinely believes they
+    /// went — which is the whole point.
+    pub fn blackhole(&self, direction: Direction) {
+        self.inner.blackholed[direction.index()].store(true, Ordering::Release);
+    }
+
+    /// Let a direction carry frames again.
+    pub fn restore(&self, direction: Direction) {
+        self.inner.blackholed[direction.index()].store(false, Ordering::Release);
+    }
+
+    /// Whether a direction is discarding everything.
+    #[must_use]
+    pub fn is_blackholed(&self, direction: Direction) -> bool {
+        self.inner.blackholed[direction.index()].load(Ordering::Acquire)
     }
 
     /// Push arbitrary bytes into one direction, as if the peer had sent them.

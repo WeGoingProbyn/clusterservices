@@ -483,6 +483,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_blackholed_direction_swallows_frames_while_looking_healthy() {
+        let network = MockNetwork::new();
+        let (_listener, client, server) = pair(&network).await;
+        let (mut tx, _) = client.split();
+        let (_, mut rx) = server.split();
+        let link = network.last_link().expect("link");
+
+        link.blackhole(Direction::ToServer);
+        assert!(link.is_blackholed(Direction::ToServer));
+
+        // The send succeeds — that is the trap. A half-open connection accepts
+        // writes and delivers nothing, and the sender cannot tell.
+        tx.send(data(b"into the void")).await.expect("send");
+        tx.send(data(b"also lost")).await.expect("send");
+        assert!(link.is_alive(), "nothing broke");
+        assert_eq!(
+            link.frames_sent(Direction::ToServer),
+            2,
+            "the sender believes both went"
+        );
+        assert_eq!(
+            link.frames_received(Direction::ToServer),
+            0,
+            "and neither did"
+        );
+
+        // The reader gets nothing at all, rather than an error.
+        let waiting = tokio::spawn(async move { rx.recv().await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiting.is_finished(),
+            "a blackholed link must be silent, not broken"
+        );
+        waiting.abort();
+    }
+
+    #[tokio::test]
+    async fn a_blackhole_can_be_lifted_and_the_other_direction_is_unaffected() {
+        let network = MockNetwork::new();
+        let (_listener, client, server) = pair(&network).await;
+        let (mut client_tx, mut client_rx) = client.split();
+        let (mut server_tx, mut server_rx) = server.split();
+        let link = network.last_link().expect("link");
+
+        link.blackhole(Direction::ToServer);
+        client_tx.send(data(b"lost")).await.expect("send");
+        // The reverse direction still works, which is what makes it *half* open.
+        server_tx.send(data(b"arrives")).await.expect("send");
+        assert!(client_rx.recv().await.expect("recv").is_some());
+
+        link.restore(Direction::ToServer);
+        assert!(!link.is_blackholed(Direction::ToServer));
+        client_tx.send(data(b"gets through")).await.expect("send");
+        let Some(Frame::Data(got)) = server_rx.recv().await.expect("recv") else {
+            panic!("expected data");
+        };
+        assert_eq!(got.payload, Bytes::from_static(b"gets through"));
+    }
+
+    #[tokio::test]
     async fn injecting_into_a_dead_link_fails() {
         let network = MockNetwork::new();
         let (_listener, _client, _server) = pair(&network).await;

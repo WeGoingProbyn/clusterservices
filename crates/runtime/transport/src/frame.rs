@@ -67,6 +67,12 @@ pub enum Frame {
     CommandResult(CommandResult),
     /// Proof of life.
     Heartbeat(Heartbeat),
+    /// Which nodes the sender can reach, sent upward by a tier that serves others.
+    Reachable(Reachable),
+    /// Ask a peer what it knows.
+    Status(StatusRequest),
+    /// The answer to exactly one [`Frame::Status`].
+    StatusReport(StatusReport),
 }
 
 impl Frame {
@@ -89,6 +95,9 @@ impl Frame {
             Self::Command(_) => "command",
             Self::CommandResult(_) => "command_result",
             Self::Heartbeat(_) => "heartbeat",
+            Self::Reachable(_) => "reachable",
+            Self::Status(_) => "status",
+            Self::StatusReport(_) => "status_report",
         }
     }
 
@@ -166,6 +175,9 @@ impl Frame {
             Self::Heartbeat(hb) => proto::frame::Body::Heartbeat(proto::Heartbeat {
                 sent_unix_ms: hb.sent_unix_ms,
             }),
+            Self::Reachable(reach) => proto::frame::Body::Reachable(reach.into_proto()),
+            Self::Status(status) => proto::frame::Body::Status(proto::Status { id: status.id.0 }),
+            Self::StatusReport(report) => proto::frame::Body::StatusReport(report.into_proto()),
         };
         proto::Frame { body: Some(body) }
     }
@@ -188,6 +200,20 @@ impl Frame {
             proto::frame::Body::Heartbeat(hb) => Self::Heartbeat(Heartbeat {
                 sent_unix_ms: hb.sent_unix_ms,
             }),
+            proto::frame::Body::Reachable(reach) => {
+                Self::Reachable(Reachable::try_from_proto(reach)?)
+            }
+            proto::frame::Body::Status(status) => {
+                if status.id == 0 {
+                    return Err(decode_error("status request has no id"));
+                }
+                Self::Status(StatusRequest {
+                    id: CommandId(status.id),
+                })
+            }
+            proto::frame::Body::StatusReport(report) => {
+                Self::StatusReport(StatusReport::try_from_proto(report)?)
+            }
         })
     }
 }
@@ -217,6 +243,15 @@ impl fmt::Display for Frame {
             Self::Command(cmd) => write!(f, "command {} {} -> {}", cmd.id, cmd.kind, cmd.target()),
             Self::CommandResult(res) => write!(f, "result {} {}", res.id, res.outcome),
             Self::Heartbeat(_) => f.write_str("heartbeat"),
+            Self::Reachable(reach) => write!(f, "reachable ({} nodes)", reach.nodes.len()),
+            Self::Status(status) => write!(f, "status {}", status.id),
+            Self::StatusReport(report) => write!(
+                f,
+                "status report {} from {} ({} nodes)",
+                report.id,
+                report.node,
+                report.nodes.len()
+            ),
         }
     }
 }
@@ -451,10 +486,7 @@ impl Hello {
             services: self
                 .services
                 .into_iter()
-                .map(|s| proto::ServiceInfo {
-                    name: s.name,
-                    version: s.version,
-                })
+                .map(ServiceInfo::into_proto)
                 .collect(),
         }
     }
@@ -466,16 +498,7 @@ impl Hello {
         let services = hello
             .services
             .into_iter()
-            .map(|s| {
-                if s.name.is_empty() {
-                    Err(decode_error("hello advertises a service with no name"))
-                } else {
-                    Ok(ServiceInfo {
-                        name: s.name,
-                        version: s.version,
-                    })
-                }
-            })
+            .map(ServiceInfo::try_from_proto)
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             node: hello.node,
@@ -506,10 +529,346 @@ impl ServiceInfo {
     }
 }
 
+impl ServiceInfo {
+    fn into_proto(self) -> proto::ServiceInfo {
+        proto::ServiceInfo {
+            name: self.name,
+            version: self.version,
+        }
+    }
+
+    fn try_from_proto(info: proto::ServiceInfo) -> Result<Self> {
+        if info.name.is_empty() {
+            return Err(decode_error("a service with no name was advertised"));
+        }
+        Ok(Self {
+            name: info.name,
+            version: info.version,
+        })
+    }
+}
+
 impl fmt::Display for ServiceInfo {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/v{}", self.name, self.version)
     }
+}
+
+/// Which nodes a peer can reach, besides itself.
+///
+/// Sent upward by any engine that serves others — a relay, a cluster head under a
+/// global tier. A leaf agent never sends one: its name is in its `Hello` and it
+/// serves nobody.
+///
+/// **Always the full current set.** A parent replaces everything it knew about this
+/// child on every announcement, so a lost frame costs a moment of staleness rather
+/// than a table that is permanently wrong in a way nothing will correct. The same
+/// argument as relative command TTLs: state that can drift is state that will.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct Reachable {
+    /// Every node below the sender. Empty says "I serve nobody now", which is how
+    /// the last agent behind a relay is retired.
+    pub nodes: Vec<NodeReach>,
+}
+
+impl Reachable {
+    /// An announcement of these nodes.
+    #[must_use]
+    pub fn new(nodes: Vec<NodeReach>) -> Self {
+        Self { nodes }
+    }
+
+    fn into_proto(self) -> proto::Reachable {
+        proto::Reachable {
+            nodes: self.nodes.into_iter().map(NodeReach::into_proto).collect(),
+        }
+    }
+
+    fn try_from_proto(reach: proto::Reachable) -> Result<Self> {
+        Ok(Self {
+            nodes: reach
+                .nodes
+                .into_iter()
+                .map(NodeReach::try_from_proto)
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// One node somebody can reach.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NodeReach {
+    /// The node's name. Never empty.
+    pub node: String,
+    /// Connections between the sender and that node; 1 means directly connected to
+    /// the sender, so a tier passing this on adds one.
+    pub hops: u32,
+    /// What it runs, if the sender knows. Empty means unknown, not none.
+    pub services: Vec<ServiceInfo>,
+}
+
+impl NodeReach {
+    /// A node this far away.
+    #[must_use]
+    pub fn new(node: impl Into<String>, hops: u32) -> Self {
+        Self {
+            node: node.into(),
+            hops,
+            services: Vec::new(),
+        }
+    }
+
+    /// Say what it runs.
+    #[must_use]
+    pub fn running(mut self, services: Vec<ServiceInfo>) -> Self {
+        self.services = services;
+        self
+    }
+
+    /// The same node, one connection further away.
+    #[must_use]
+    pub fn one_hop_further(mut self) -> Self {
+        self.hops = self.hops.saturating_add(1);
+        self
+    }
+
+    fn into_proto(self) -> proto::NodeReach {
+        proto::NodeReach {
+            node: self.node,
+            hops: self.hops,
+            services: self
+                .services
+                .into_iter()
+                .map(ServiceInfo::into_proto)
+                .collect(),
+        }
+    }
+
+    fn try_from_proto(reach: proto::NodeReach) -> Result<Self> {
+        if reach.node.is_empty() {
+            return Err(decode_error("a reachable node has no name"));
+        }
+        if reach.hops == 0 {
+            // Zero would mean "this node is the sender", which `Hello` already says
+            // and which would make a routing table point at itself.
+            return Err(decode_error("a reachable node is zero hops away"));
+        }
+        Ok(Self {
+            node: reach.node,
+            hops: reach.hops,
+            services: reach
+                .services
+                .into_iter()
+                .map(ServiceInfo::try_from_proto)
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+impl fmt::Display for NodeReach {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({} hops)", self.node, self.hops)
+    }
+}
+
+/// Ask a peer what it knows.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StatusRequest {
+    /// Unique per connection; the answer carries it back. Never 0.
+    pub id: CommandId,
+}
+
+impl StatusRequest {
+    /// A request that will be answered with this id.
+    #[must_use]
+    pub const fn new(id: CommandId) -> Self {
+        Self { id }
+    }
+}
+
+/// The answer to exactly one [`StatusRequest`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct StatusReport {
+    /// The id of the request being answered.
+    pub id: CommandId,
+    /// Who is answering.
+    pub node: String,
+    /// The answering build. Advisory.
+    pub build: String,
+    /// How long that engine has been running. A duration, not a timestamp: nothing
+    /// in this protocol compares two peers' clocks.
+    pub uptime: Duration,
+    /// Every node it can reach, direct and indirect.
+    pub nodes: Vec<KnownNode>,
+}
+
+impl StatusReport {
+    /// An answer from `node`.
+    #[must_use]
+    pub fn new(id: CommandId, node: impl Into<String>) -> Self {
+        Self {
+            id,
+            node: node.into(),
+            build: String::new(),
+            uptime: Duration::ZERO,
+            nodes: Vec::new(),
+        }
+    }
+
+    /// Say which build is answering.
+    #[must_use]
+    pub fn with_build(mut self, build: impl Into<String>) -> Self {
+        self.build = build.into();
+        self
+    }
+
+    /// Say how long it has been up.
+    #[must_use]
+    pub const fn up_for(mut self, uptime: Duration) -> Self {
+        self.uptime = uptime;
+        self
+    }
+
+    /// Say what it can reach.
+    #[must_use]
+    pub fn reaching(mut self, nodes: Vec<KnownNode>) -> Self {
+        self.nodes = nodes;
+        self
+    }
+
+    fn into_proto(self) -> proto::StatusReport {
+        proto::StatusReport {
+            id: self.id.0,
+            node: self.node,
+            build: self.build,
+            uptime_ms: millis(self.uptime),
+            nodes: self.nodes.into_iter().map(KnownNode::into_proto).collect(),
+        }
+    }
+
+    fn try_from_proto(report: proto::StatusReport) -> Result<Self> {
+        if report.id == 0 {
+            return Err(decode_error("status report answers no request"));
+        }
+        if report.node.is_empty() {
+            return Err(decode_error("status report has no node"));
+        }
+        Ok(Self {
+            id: CommandId(report.id),
+            node: report.node,
+            build: report.build,
+            uptime: Duration::from_millis(report.uptime_ms),
+            nodes: report
+                .nodes
+                .into_iter()
+                .map(KnownNode::try_from_proto)
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// One node an engine can reach, as reported to an operator.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct KnownNode {
+    /// The node's name.
+    pub node: String,
+    /// The direct peer it is behind, or empty when it *is* a direct peer.
+    pub via: String,
+    /// Where a direct peer connected from. Empty for an indirect one.
+    pub endpoint: String,
+    /// How long a direct peer has been connected. `None` for an indirect node:
+    /// only the tier it is attached to knows, and guessing would be worse.
+    pub connected: Option<Duration>,
+    /// Connections away. 1 for a direct peer.
+    pub hops: u32,
+    /// What it runs, when known.
+    pub services: Vec<ServiceInfo>,
+}
+
+impl KnownNode {
+    /// A directly connected node.
+    #[must_use]
+    pub fn direct(
+        node: impl Into<String>,
+        endpoint: impl Into<String>,
+        connected: Duration,
+    ) -> Self {
+        Self {
+            node: node.into(),
+            via: String::new(),
+            endpoint: endpoint.into(),
+            connected: Some(connected),
+            hops: 1,
+            services: Vec::new(),
+        }
+    }
+
+    /// A node behind another one.
+    #[must_use]
+    pub fn behind(node: impl Into<String>, via: impl Into<String>, hops: u32) -> Self {
+        Self {
+            node: node.into(),
+            via: via.into(),
+            endpoint: String::new(),
+            connected: None,
+            hops,
+            services: Vec::new(),
+        }
+    }
+
+    /// Say what it runs.
+    #[must_use]
+    pub fn running(mut self, services: Vec<ServiceInfo>) -> Self {
+        self.services = services;
+        self
+    }
+
+    /// Whether this node is connected to the answering engine itself.
+    #[must_use]
+    pub fn is_direct(&self) -> bool {
+        self.via.is_empty()
+    }
+
+    fn into_proto(self) -> proto::KnownNode {
+        proto::KnownNode {
+            node: self.node,
+            via: self.via,
+            endpoint: self.endpoint,
+            connected_ms: self.connected.map_or(0, millis),
+            hops: self.hops,
+            services: self
+                .services
+                .into_iter()
+                .map(ServiceInfo::into_proto)
+                .collect(),
+        }
+    }
+
+    fn try_from_proto(known: proto::KnownNode) -> Result<Self> {
+        if known.node.is_empty() {
+            return Err(decode_error("a known node has no name"));
+        }
+        if known.hops == 0 {
+            return Err(decode_error("a known node is zero hops away"));
+        }
+        Ok(Self {
+            node: known.node,
+            via: known.via,
+            endpoint: known.endpoint,
+            connected: (known.connected_ms > 0).then(|| Duration::from_millis(known.connected_ms)),
+            hops: known.hops,
+            services: known
+                .services
+                .into_iter()
+                .map(ServiceInfo::try_from_proto)
+                .collect::<Result<_>>()?,
+        })
+    }
+}
+
+/// A duration as whole milliseconds, saturating rather than wrapping.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// A clean close.
@@ -650,6 +1009,13 @@ pub struct CommandFrame {
     /// a queue, so expiry needs no clock synchronisation between the two peers.
     /// `None` means it never expires.
     pub ttl: Option<Duration>,
+    /// Which node this is for, when that is not the peer it is being sent to.
+    ///
+    /// Empty on the server → agent hop: the target is the peer the frame is
+    /// addressed to, and naming it again could only disagree with the connection
+    /// it arrived on. An operator has to fill it in, because its one connection
+    /// reaches every node the head serves.
+    pub node: String,
 }
 
 impl CommandFrame {
@@ -662,6 +1028,7 @@ impl CommandFrame {
             kind,
             force: false,
             ttl: None,
+            node: String::new(),
         }
     }
 
@@ -674,6 +1041,7 @@ impl CommandFrame {
             kind,
             force: false,
             ttl: None,
+            node: String::new(),
         }
     }
 
@@ -681,6 +1049,13 @@ impl CommandFrame {
     #[must_use]
     pub const fn with_ttl(mut self, ttl: Option<Duration>) -> Self {
         self.ttl = ttl;
+        self
+    }
+
+    /// Name the node this command is for, for a peer that serves more than one.
+    #[must_use]
+    pub fn for_node(mut self, node: impl Into<String>) -> Self {
+        self.node = node.into();
         self
     }
 
@@ -722,6 +1097,7 @@ impl CommandFrame {
                 .ttl
                 .map_or(0, |ttl| u64::try_from(ttl.as_millis()).unwrap_or(u64::MAX)),
             payload,
+            node: self.node,
         }
     }
 
@@ -748,6 +1124,7 @@ impl CommandFrame {
                 0 => None,
                 ms => Some(Duration::from_millis(ms)),
             },
+            node: cmd.node,
         })
     }
 }
@@ -1040,6 +1417,34 @@ mod tests {
         assert_eq!(frame.payload_len(), 11);
     }
 
+    /// A command that names its target: what an operator sends, and what a tier
+    /// forwarding downward will send.
+    #[test]
+    fn a_command_can_name_the_node_it_is_for() {
+        let frame = Frame::Command(
+            CommandFrame::for_service(CommandId(4), "selfmon", CommandKind::Restart)
+                .for_node("node-7"),
+        );
+        let decoded = round_trip(frame.clone());
+        assert_eq!(decoded, frame);
+
+        let Frame::Command(cmd) = decoded else {
+            panic!("expected command");
+        };
+        assert_eq!(cmd.node, "node-7");
+    }
+
+    /// Empty is the normal case and stays empty: on a server → agent hop the
+    /// connection already says which node, and a second answer could disagree.
+    #[test]
+    fn a_command_without_a_node_names_none() {
+        let frame = Frame::Command(CommandFrame::for_agent(CommandId(1), CommandKind::Shutdown));
+        let Frame::Command(cmd) = round_trip(frame) else {
+            panic!("expected command");
+        };
+        assert!(cmd.node.is_empty());
+    }
+
     #[test]
     fn agent_wide_commands_have_no_service() {
         let frame = Frame::Command(CommandFrame::for_agent(CommandId(1), CommandKind::Restart));
@@ -1234,6 +1639,43 @@ mod tests {
                 }),
                 "command result has no id",
             ),
+            (
+                proto::frame::Body::Status(proto::Status { id: 0 }),
+                "status request has no id",
+            ),
+            (
+                proto::frame::Body::StatusReport(proto::StatusReport::default()),
+                "status report answers no request",
+            ),
+            (
+                proto::frame::Body::StatusReport(proto::StatusReport {
+                    id: 1,
+                    ..proto::StatusReport::default()
+                }),
+                "status report has no node",
+            ),
+            (
+                proto::frame::Body::Reachable(proto::Reachable {
+                    nodes: vec![proto::NodeReach {
+                        node: String::new(),
+                        hops: 1,
+                        services: Vec::new(),
+                    }],
+                }),
+                "reachable node has no name",
+            ),
+            // Zero hops would mean "the sender itself", which `Hello` already says
+            // and which would make a routing table point at the peer it came from.
+            (
+                proto::frame::Body::Reachable(proto::Reachable {
+                    nodes: vec![proto::NodeReach {
+                        node: "node-1".into(),
+                        hops: 0,
+                        services: Vec::new(),
+                    }],
+                }),
+                "zero hops away",
+            ),
         ];
         for (body, expected) in cases {
             let err = decode_proto(proto::Frame { body: Some(body) });
@@ -1242,6 +1684,74 @@ mod tests {
                 "expected {expected:?}, got {err}"
             );
         }
+    }
+
+    #[test]
+    fn a_reachability_announcement_round_trips() {
+        let frame = Frame::Reachable(Reachable::new(vec![
+            NodeReach::new("node-1", 1).running(vec![ServiceInfo::new("cgroup", 1)]),
+            NodeReach::new("node-2", 3),
+        ]));
+        assert_eq!(
+            frame.lane(),
+            Lane::Control,
+            "reachability is control traffic"
+        );
+        let decoded = round_trip(frame.clone());
+        assert_eq!(decoded, frame);
+
+        let Frame::Reachable(reach) = decoded else {
+            panic!("expected reachability");
+        };
+        assert_eq!(reach.nodes[0].hops, 1);
+        assert_eq!(reach.nodes[0].services, vec![ServiceInfo::new("cgroup", 1)]);
+        assert_eq!(
+            reach.nodes[1].clone().one_hop_further().hops,
+            4,
+            "a tier passing this on adds a hop"
+        );
+    }
+
+    /// The empty announcement is not a no-op: it retires everything behind a peer.
+    #[test]
+    fn an_empty_reachability_announcement_survives_the_wire() {
+        let Frame::Reachable(reach) = round_trip(Frame::Reachable(Reachable::default())) else {
+            panic!("expected reachability");
+        };
+        assert!(reach.nodes.is_empty());
+    }
+
+    #[test]
+    fn a_status_exchange_round_trips() {
+        let request = Frame::Status(StatusRequest::new(CommandId(7)));
+        assert_eq!(request.lane(), Lane::Control);
+        assert_eq!(round_trip(request.clone()), request);
+
+        let report = Frame::StatusReport(
+            StatusReport::new(CommandId(7), "head01")
+                .with_build("cs-server 0.1.0")
+                .up_for(Duration::from_secs(90))
+                .reaching(vec![
+                    KnownNode::direct("node-1", "tcp://10.0.0.1:5", Duration::from_secs(30))
+                        .running(vec![ServiceInfo::new("selfmon", 1)]),
+                    KnownNode::behind("node-2", "relay-a", 2),
+                ]),
+        );
+        let decoded = round_trip(report.clone());
+        assert_eq!(decoded, report);
+
+        let Frame::StatusReport(report) = decoded else {
+            panic!("expected a report");
+        };
+        assert_eq!(report.uptime, Duration::from_secs(90));
+        assert!(report.nodes[0].is_direct());
+        assert_eq!(report.nodes[0].connected, Some(Duration::from_secs(30)));
+        assert!(!report.nodes[1].is_direct());
+        assert_eq!(report.nodes[1].via, "relay-a");
+        assert_eq!(
+            report.nodes[1].connected, None,
+            "only the tier a node is attached to knows how long it has been there"
+        );
     }
 
     #[test]

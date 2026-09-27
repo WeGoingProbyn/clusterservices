@@ -87,7 +87,7 @@ pub use service::{
     Cmd, Data, MAX_SERVICE_NAME_LEN, ServiceBound, ServiceDef, ServiceId, is_valid_service_name,
 };
 pub use stats::{EngineStats, ServiceStats};
-pub use wire::{Encodable, NoCommand, Wire};
+pub use wire::{Encodable, Never, NoCommand, NoData, Wire};
 
 // Re-exported so a plugin's `Cargo.toml` needs one dependency, not four.
 pub use bytes;

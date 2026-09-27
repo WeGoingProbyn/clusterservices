@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core/*", "crates/runtime/*", "crates/plugins/*"]
+members = ["crates/core/*", "crates/runtime/*", "crates/plugins/*", "apps/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -17,8 +17,12 @@ cs-api = { path = "crates/core/api" }
 cs-transport = { path = "crates/runtime/transport" }
 cs-transport-mock = { path = "crates/runtime/transport-mock" }
 cs-transport-tcp = { path = "crates/runtime/transport-tcp" }
+cs-operator = { path = "crates/runtime/operator" }
 cs-engine = { path = "crates/runtime/engine" }
 cs-testkit = { path = "crates/runtime/testkit" }
+# plugins
+cs-plugin-cgroup = { path = "crates/plugins/cgroup" }
+cs-plugin-selfmon = { path = "crates/plugins/selfmon" }
 # third party
 bytes = "1"
 prost = "0.14"
@@ -26,7 +30,13 @@ prost-build = "0.14"
 protox = "0.9"
 tokio = "1"
 tracing = "0.1"
+# Only the binaries install a subscriber; the libraries just emit events.
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tempfile = "3"
+# Declared here so a config file is two lines away when you want one. Nothing
+# references them yet.
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
 
 [workspace.lints.rust]
 missing_docs = "warn"

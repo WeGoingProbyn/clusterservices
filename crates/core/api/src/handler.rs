@@ -4,20 +4,51 @@ use cs_util::Result;
 
 use crate::{Data, ServiceBound, ServiceCtx};
 
-/// Who sent a message, and what they said they were.
+/// Where a message came from.
 ///
 /// A handler needs this for the obvious reason — metrics are worthless without
 /// knowing which node they describe — and for the less obvious one: a command is
 /// addressed to a node by name, so this is what makes `ctx.command(origin.node,
 /// ..)` possible from inside a handler.
+///
+/// # `node` and `via` are the same thing today, and will not always be
+///
+/// In a two-tier deployment — agents dialling one server — the node that produced
+/// a batch *is* the peer that delivered it, and these two fields always match.
+/// Once a relay or a cluster head forwards data upward they diverge: `node` stays
+/// the agent that measured something, while `via` becomes the tier that passed it
+/// on.
+///
+/// The distinction is drawn now, before any relay exists, because it is a
+/// *semantic* change to a plugin-facing type rather than an additive one to the
+/// wire format. A handler written today against "`node` is where this came from"
+/// keeps working when a tier is inserted beneath it; one written against "`node`
+/// is who I am talking to" would silently start attributing every node's metrics
+/// to a relay. Use `node` to attribute data and to address a command; use `via`
+/// only for diagnostics about the path it took.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Origin<'a> {
-    /// The sender's node name, exactly as it gave in its `Hello`.
+    /// The node that **produced** this message, as it named itself in its
+    /// `Hello`. What data should be attributed to, and what a command should be
+    /// addressed to.
     pub node: &'a str,
-    /// The [`ServiceDef::VERSION`](crate::ServiceDef::VERSION) the sender declared
+    /// The peer this message was **delivered by** — the far end of the connection
+    /// it arrived on. Equal to [`node`](Origin::node) unless a tier forwarded it.
+    pub via: &'a str,
+    /// The [`ServiceDef::VERSION`](crate::ServiceDef::VERSION) the producer declared
     /// for this service, so a handler can notice a version skew rather than
     /// misread the message.
     pub service_version: u32,
+}
+
+impl Origin<'_> {
+    /// Whether this arrived straight from the node that produced it.
+    ///
+    /// False once a relay or cluster head is in the path.
+    #[must_use]
+    pub fn is_direct(&self) -> bool {
+        self.node == self.via
+    }
 }
 
 /// The server side of a service: what happens to data when it arrives.
@@ -59,7 +90,7 @@ pub struct Origin<'a> {
 ///         from: Origin<'_>,
 ///         msg: String,
 ///     ) -> Result<()> {
-///         // `from.node` is which node this came from; `ctx.node()` is us.
+///         // `from.node` is which node measured this; `ctx.node()` is us.
 ///         let _ = (from.node, ctx.node(), msg);
 ///         self.rows.fetch_add(1, Ordering::Relaxed);
 ///         Ok(())
@@ -100,6 +131,7 @@ mod tests {
     fn origin() -> Origin<'static> {
         Origin {
             node: "node-0042",
+            via: "node-0042",
             service_version: 1,
         }
     }
@@ -186,6 +218,24 @@ mod tests {
         let handler = Collect::default();
         block_on(handler.shutdown());
         assert!(*handler.closed.lock().expect("lock"));
+    }
+
+    #[test]
+    fn a_direct_connection_reports_the_same_node_twice() {
+        assert!(origin().is_direct(), "no tier in between");
+
+        // What a relay will look like: the agent still owns the data, the relay
+        // merely carried it.
+        let forwarded = Origin {
+            node: "node-0042",
+            via: "rack3-relay",
+            service_version: 1,
+        };
+        assert!(!forwarded.is_direct());
+        assert_eq!(
+            forwarded.node, "node-0042",
+            "attribution follows the producer, never the carrier"
+        );
     }
 
     #[test]

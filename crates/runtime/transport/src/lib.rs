@@ -65,7 +65,8 @@ pub use caps::Capabilities;
 pub use endpoint::Endpoint;
 pub use frame::{
     Chunk, CommandFrame, CommandId, CommandKind, CommandResult, DataFrame, Frame, Goodbye,
-    GoodbyeReason, Heartbeat, Hello, Lane, Outcome, PROTOCOL_VERSION, ServiceInfo,
+    GoodbyeReason, Heartbeat, Hello, KnownNode, Lane, NodeReach, Outcome, PROTOCOL_VERSION,
+    Reachable, ServiceInfo, StatusReport, StatusRequest,
 };
 pub use trace::{ErrorTrace, TraceFrame};
 pub use traits::{Connection, FrameRx, FrameTx, Listener, Transport};

@@ -1,0 +1,40 @@
+# The cluster head.
+#
+#   install -m644 cs-server.service /etc/systemd/system/
+#   install -m644 -D server.env.example /etc/clusterservices/server.env
+#   systemctl enable --now cs-server
+#
+# Read `cs-ctl`'s notes before widening CS_ADMIN: reaching the admin endpoint is
+# the whole of the authorization for restarting every node this head serves.
+
+[Unit]
+Description=clusterservices cluster head
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/clusterservices/server.env
+# CS_LISTEN, CS_ADMIN and CS_NODE come from the environment file; the defaults
+# (0.0.0.0:7777 for agents, 127.0.0.1:7788 for operators) are already sensible.
+ExecStart=/usr/bin/cs-server
+
+Restart=on-failure
+RestartForceExitStatus=75
+RestartSec=5s
+TimeoutStopSec=20s
+
+# The head needs no privilege at all: it binds two unprivileged ports, reads
+# nothing and writes nothing. A transient user costs nothing to maintain, and
+# `StateDirectory` is where storage will go when there is any — as
+# /var/lib/clusterservices, owned by whoever this turns out to be.
+DynamicUser=yes
+StateDirectory=clusterservices
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

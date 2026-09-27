@@ -20,6 +20,14 @@ pub struct EngineStats {
     pub peers: u32,
     /// Times a connection was established after a failure or a drop.
     pub reconnects: u64,
+    /// Peers dropped for going silent — no frame within
+    /// `EngineConfig::peer_timeout`.
+    ///
+    /// Worth watching separately from [`reconnects`](EngineStats::reconnects): a
+    /// reconnect after a clean close is ordinary, while a timeout means a peer
+    /// stopped talking without saying so, which is what a powered-off node looks
+    /// like.
+    pub peer_timeouts: u64,
     /// Frames handed to the transport.
     pub frames_sent: u64,
     /// Frames read from the transport.

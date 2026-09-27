@@ -10,7 +10,7 @@ publish.workspace = true
 cs-transport.workspace = true
 cs-util.workspace = true
 bytes.workspace = true
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }

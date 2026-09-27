@@ -283,6 +283,8 @@ impl Sampler for BulkSampler {
 pub struct Collect<S: ServiceDef> {
     seen: Arc<Mutex<Vec<S::Data>>>,
     senders: Arc<Mutex<Vec<String>>>,
+    /// Peers that forwarded rather than produced — empty until a relay exists.
+    carriers: Arc<Mutex<Vec<String>>>,
     shutdowns: Arc<AtomicU32>,
     fail_everything: bool,
     _service: PhantomData<fn() -> S>,
@@ -295,6 +297,7 @@ impl<S: ServiceDef> Collect<S> {
         Self {
             seen: Arc::new(Mutex::new(Vec::new())),
             senders: Arc::new(Mutex::new(Vec::new())),
+            carriers: Arc::new(Mutex::new(Vec::new())),
             shutdowns: Arc::new(AtomicU32::new(0)),
             fail_everything: false,
             _service: PhantomData,
@@ -335,6 +338,15 @@ impl<S: ServiceDef> Collect<S> {
         lock(&self.senders).clone()
     }
 
+    /// Peers that forwarded a message rather than producing it.
+    ///
+    /// Empty in a two-tier deployment, which is the assertion worth making until
+    /// relays exist.
+    #[must_use]
+    pub fn carriers(&self) -> Vec<String> {
+        lock(&self.carriers).clone()
+    }
+
     /// How many times [`Handler::shutdown`] ran.
     #[must_use]
     pub fn shutdowns(&self) -> u32 {
@@ -353,6 +365,7 @@ impl<S: ServiceDef> Clone for Collect<S> {
         Self {
             seen: Arc::clone(&self.seen),
             senders: Arc::clone(&self.senders),
+            carriers: Arc::clone(&self.carriers),
             shutdowns: Arc::clone(&self.shutdowns),
             fail_everything: self.fail_everything,
             _service: PhantomData,
@@ -373,6 +386,9 @@ impl<S: ServiceDef> Handler for Collect<S> {
             ));
         }
         lock(&self.senders).push(from.node.to_owned());
+        if !from.is_direct() {
+            lock(&self.carriers).push(from.via.to_owned());
+        }
         lock(&self.seen).push(message);
         Ok(())
     }

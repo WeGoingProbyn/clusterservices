@@ -1,0 +1,32 @@
+[package]
+name = "cs-ctl"
+description = "The operator CLI: tell nodes to do things and print what they said."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cs-ctl"
+path = "src/main.rs"
+
+[dependencies]
+# The protocol work is in cs-operator, shared with the engine's own tests. What is
+# left here is the hostlist, the table and the exit status.
+cs-operator.workspace = true
+cs-transport.workspace = true
+cs-util.workspace = true
+# `time` for the answer timeout; no `signal`, because there is nothing to shut down
+# gracefully — a ctl that is interrupted has simply stopped waiting.
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tracing-subscriber.workspace = true
+
+# Rule 5: a concrete transport sits behind a feature.
+cs-transport-tcp = { workspace = true, optional = true }
+
+[features]
+default = ["tcp"]
+tcp = ["dep:cs-transport-tcp"]
+
+[lints]
+workspace = true

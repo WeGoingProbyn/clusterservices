@@ -111,7 +111,9 @@ pub struct Error(Box<Inner>);
 struct Inner {
     kind: ErrorKind,
     msg: Message,
-    location: &'static Location<'static>,
+    /// Where this frame was created, or `None` for one that happened somewhere
+    /// this process cannot point at — see [`Error::remote`].
+    location: Option<&'static Location<'static>>,
     /// The next frame of *our* chain, added by [`Error::context`].
     source: Option<Error>,
 }
@@ -141,8 +143,38 @@ impl Error {
         Self(Box::new(Inner {
             kind,
             msg: Message::Text(msg.into()),
-            location: Location::caller(),
+            location: Some(Location::caller()),
             source: None,
+        }))
+    }
+
+    /// A frame for something that went wrong somewhere else.
+    ///
+    /// Deliberately **not** `#[track_caller]`: the caller is whatever is rebuilding
+    /// a chain that arrived over the network, and recording that line would point
+    /// at the messenger. The original `file:line` travels in the message instead,
+    /// which is what `ErrorTrace::to_error` puts there — so a remote chain prints
+    /// exactly as it did on the node it happened on, once, rather than with this
+    /// build's line appended to every frame.
+    #[must_use]
+    pub fn remote(kind: ErrorKind, msg: impl Into<String>) -> Self {
+        Self(Box::new(Inner {
+            kind,
+            msg: Message::Text(msg.into()),
+            location: None,
+            source: None,
+        }))
+    }
+
+    /// Add an outer frame that also happened somewhere else. See [`Error::remote`].
+    #[must_use]
+    pub fn remote_context(self, msg: impl Into<String>) -> Self {
+        let kind = self.0.kind;
+        Self(Box::new(Inner {
+            kind,
+            msg: Message::Text(msg.into()),
+            location: None,
+            source: Some(self),
         }))
     }
 
@@ -167,7 +199,7 @@ impl Error {
         msg: impl Into<String>,
         source: impl StdError + Send + Sync + 'static,
     ) -> Self {
-        let location = Location::caller();
+        let location = Some(Location::caller());
         Self(Box::new(Inner {
             kind,
             msg: Message::Text(msg.into()),
@@ -188,7 +220,7 @@ impl Error {
         Self(Box::new(Inner {
             kind,
             msg: Message::Foreign(Box::new(source)),
-            location: Location::caller(),
+            location: Some(Location::caller()),
             source: None,
         }))
     }
@@ -201,7 +233,7 @@ impl Error {
         Self(Box::new(Inner {
             kind: self.kind(),
             msg: Message::Text(msg.into()),
-            location: Location::caller(),
+            location: Some(Location::caller()),
             source: Some(self),
         }))
     }
@@ -215,7 +247,7 @@ impl Error {
         Self(Box::new(Inner {
             kind: self.kind(),
             msg: Message::Text(msg().into()),
-            location: Location::caller(),
+            location: Some(Location::caller()),
             source: Some(self),
         }))
     }
@@ -245,8 +277,11 @@ impl Error {
     }
 
     /// Where the outermost frame was created.
+    ///
+    /// `None` for a frame rebuilt from another node's error, which happened at a
+    /// line in *that* build — see [`Error::remote`].
     #[must_use]
-    pub fn location(&self) -> &'static Location<'static> {
+    pub fn location(&self) -> Option<&'static Location<'static>> {
         self.0.location
     }
 
@@ -301,7 +336,7 @@ impl Error {
     fn frame(&self) -> Frame<'_> {
         Frame {
             message: &self.0.msg,
-            location: Some(self.0.location),
+            location: self.0.location,
             kind: Some(self.0.kind),
         }
     }
@@ -363,7 +398,7 @@ impl From<std::io::Error> for Error {
         Self(Box::new(Inner {
             kind: ErrorKind::Io,
             msg: Message::Foreign(Box::new(err)),
-            location: Location::caller(),
+            location: Some(Location::caller()),
             source: None,
         }))
     }
@@ -487,7 +522,7 @@ impl<T, E: Into<Error>> ResultExt<T> for Result<T, E> {
                 Err(Error(Box::new(Inner {
                     kind: inner.kind(),
                     msg: Message::Text(msg.into()),
-                    location: Location::caller(),
+                    location: Some(Location::caller()),
                     source: Some(inner),
                 })))
             }
@@ -503,7 +538,7 @@ impl<T, E: Into<Error>> ResultExt<T> for Result<T, E> {
                 Err(Error(Box::new(Inner {
                     kind: inner.kind(),
                     msg: Message::Text(msg().into()),
-                    location: Location::caller(),
+                    location: Some(Location::caller()),
                     source: Some(inner),
                 })))
             }
@@ -545,7 +580,10 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Transport);
         assert!(err.is_retryable());
-        assert_eq!(err.location().line(), outer_line);
+        assert_eq!(
+            err.location().map(std::panic::Location::line),
+            Some(outer_line)
+        );
 
         let frames: Vec<_> = err.chain().collect();
         assert_eq!(frames.len(), 2);
@@ -707,6 +745,32 @@ mod tests {
             assert_eq!(ErrorKind::parse(kind.as_str()), Some(kind));
             assert_eq!(kind.as_str().parse::<ErrorKind>().unwrap(), kind);
         }
+    }
+
+    /// A frame from another node claims no line in this build: it already carries
+    /// the remote `file:line` in its message, and two locations for one failure is
+    /// how a rebuilt chain stops reading like the original.
+    #[test]
+    fn a_remote_frame_has_no_local_location() {
+        let err = Error::remote(
+            ErrorKind::Rejected,
+            "no node named \"node-6\" @ engine.rs:166",
+        )
+        .remote_context("forwarding a command @ peer.rs:512");
+        assert!(err.location().is_none());
+        assert!(err.chain().all(|frame| frame.location().is_none()));
+
+        let shown = format!("{err:#}");
+        assert_eq!(
+            shown.matches(" @ ").count(),
+            2,
+            "one location per frame, the remote one: {shown}"
+        );
+        assert_eq!(
+            err.kind(),
+            ErrorKind::Rejected,
+            "and the remote kind stands"
+        );
     }
 
     #[test]

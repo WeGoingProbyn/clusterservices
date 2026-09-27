@@ -6,11 +6,13 @@
 
 use std::time::Duration;
 
-use cs_api::{Command, CommandOpts, CommandOutcome};
+use cs_api::{Command, CommandOpts, CommandOutcome, ServiceDef};
 use cs_engine::{EngineConfig, NodeEngine, Stop};
+use cs_operator::Request;
 use cs_testkit::{
     BulkSampler, BulkService, Collect, Commander, CounterConfig, CounterService, TestCluster,
 };
+use cs_transport::Outcome;
 use cs_transport_mock::{Direction, MockNetwork};
 use cs_util::ErrorKind;
 
@@ -684,4 +686,455 @@ fn a_nameless_engine_is_rejected() {
         .unwrap_err();
     assert_eq!(err.kind(), ErrorKind::Config);
     assert!(format!("{err:?}").contains("node name"));
+}
+
+// --- peers that stop answering ------------------------------------------------
+
+/// The failure a socket cannot report: a node loses power, so there is no `FIN`
+/// and no `RST`. Writes to it keep succeeding and reads never return.
+#[tokio::test]
+async fn a_server_gives_up_on_an_agent_that_goes_silent() {
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("a connected agent", || {
+            cluster.server().expect("server").stats().peers == 1 && collected.count() >= 1
+        })
+        .await;
+    let link = cluster.link();
+
+    // The agent keeps sampling and sending; nothing arrives, and nothing errors.
+    link.blackhole(Direction::ToServer);
+    cluster
+        .wait_for("the server to give up on it", || {
+            cluster.server().expect("server").stats().peer_timeouts >= 1
+        })
+        .await;
+
+    let stats = cluster.server().expect("server").stats();
+    assert_eq!(stats.peers, 0, "the peer should have been dropped");
+    assert!(
+        link.frames_sent(Direction::ToServer) > link.frames_received(Direction::ToServer),
+        "the agent was still writing into the void"
+    );
+
+    // And the agent is not stuck: the dropped connection brings it back.
+    cluster
+        .wait_for("the agent to reconnect", || {
+            cluster.network().link_count() >= 2
+        })
+        .await;
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn an_agent_gives_up_on_a_server_that_goes_silent() {
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("a connected agent", || collected.count() >= 1)
+        .await;
+
+    // Only the server-to-agent direction fails, so the server still hears the
+    // agent and has no reason to complain.
+    cluster.link().blackhole(Direction::ToClient);
+    cluster
+        .wait_for("the agent to give up and redial", || {
+            cluster.agent().stats().peer_timeouts >= 1 && cluster.network().link_count() >= 2
+        })
+        .await;
+
+    // Data flows again on the new connection, and nothing was lost in between: the
+    // buffer outlives the connection.
+    let before = collected.count();
+    cluster
+        .wait_for("data on the replacement connection", || {
+            collected.count() > before
+        })
+        .await;
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn a_busy_connection_is_never_timed_out() {
+    // Any frame is proof of life, so a connection carrying data at well under the
+    // timeout must never be dropped however long the test runs.
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("plenty of traffic", || collected.count() >= 20)
+        .await;
+
+    assert_eq!(
+        cluster.agent().stats().peer_timeouts,
+        0,
+        "a busy agent must not be timed out"
+    );
+    assert_eq!(cluster.server().expect("server").stats().peer_timeouts, 0);
+    assert_eq!(
+        cluster.network().link_count(),
+        1,
+        "and the connection should never have been rebuilt"
+    );
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn data_arriving_straight_from_its_producer_reports_no_carrier() {
+    // The two-tier case, pinned: `node` and `via` coincide and `is_direct` holds.
+    // When a relay is inserted this test should keep passing for the relay's own
+    // agents while the tier above it starts seeing carriers.
+    let (cluster, collected, _) = simple().await;
+    cluster
+        .wait_for("some batches", || collected.count() >= 3)
+        .await;
+
+    assert!(collected.senders().iter().all(|node| node == "node-1"));
+    assert!(
+        collected.carriers().is_empty(),
+        "nothing forwarded these, so there is no carrier to report: {:?}",
+        collected.carriers()
+    );
+
+    cluster.stop().await;
+}
+
+// --- the operator path ---------------------------------------------------------
+//
+// An operator reaches the head on its admin endpoint and names the node it means;
+// the head forwards the command and sends back what the node itself said. The
+// client here is `cs-operator`, which is the same code `cs-ctl` runs — over the
+// mock rather than over TCP.
+
+#[tokio::test]
+async fn an_operator_restarts_a_service_on_a_named_node() {
+    let counter = CounterConfig::new();
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the agent to connect", || {
+            cluster.server().is_some_and(|s| s.stats().peers == 1)
+        })
+        .await;
+    let built_once = counter.builds();
+
+    let mut operator = cluster.operator("ctl@test").await;
+    let answers = operator
+        .run(
+            vec![Request::restart("node-1", Some(CounterService::NAME))],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the head should answer");
+    operator.close().await;
+
+    assert_eq!(answers.len(), 1);
+    assert_eq!(answers[0].outcome, Some(Outcome::Ok));
+    assert_eq!(answers[0].node, "node-1");
+    cluster
+        .wait_for("the rebuild", || counter.builds() > built_once)
+        .await;
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn an_operator_hears_a_service_refuse() {
+    let counter = CounterConfig::new().refuses_restart();
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the agent to connect", || {
+            cluster.server().is_some_and(|s| s.stats().peers == 1)
+        })
+        .await;
+
+    let mut operator = cluster.operator("ctl@test").await;
+    let answers = operator
+        .run(
+            vec![Request::restart("node-1", Some(CounterService::NAME))],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the head should answer");
+    operator.close().await;
+
+    assert_eq!(
+        answers[0].outcome,
+        Some(Outcome::Rejected("mid-batch".into())),
+        "the service's own reason has to survive both hops"
+    );
+
+    cluster.stop().await;
+}
+
+/// The one an operator hits most: a typo, or a node that is down.
+///
+/// Not queued and not `Expired`: a person is waiting, and "node-9 is not connected"
+/// now beats the same answer in sixty seconds.
+#[tokio::test]
+async fn an_operator_is_told_at_once_when_a_node_is_not_connected() {
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .start()
+        .await;
+
+    let mut operator = cluster.operator("ctl@test").await;
+    let answers = operator
+        .run(
+            vec![Request::restart("node-9", Some(CounterService::NAME))],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the head should answer");
+    operator.close().await;
+
+    let Some(Outcome::Failed(trace)) = &answers[0].outcome else {
+        panic!("expected a failure, got {:?}", answers[0].outcome);
+    };
+    assert_eq!(trace.node, "head01", "the head is where this went wrong");
+    let rebuilt = trace.to_error();
+    assert_eq!(rebuilt.kind(), ErrorKind::Rejected);
+    assert!(
+        rebuilt.to_string().contains("node-9"),
+        "the operator has to be told which node: {rebuilt}"
+    );
+
+    cluster.stop().await;
+}
+
+#[tokio::test]
+async fn an_operator_addresses_a_whole_agent() {
+    let counter = CounterConfig::new();
+    let mut cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .agent("node-1", {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("the agent to connect", || {
+            cluster.server().is_some_and(|s| s.stats().peers == 1)
+        })
+        .await;
+
+    let mut operator = cluster.operator("ctl@test").await;
+    let answers = operator
+        .run(
+            vec![Request::shutdown("node-1", None)],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("the head should answer");
+    operator.close().await;
+
+    assert_eq!(answers[0].outcome, Some(Outcome::Ok));
+    assert_eq!(answers[0].target(), "<agent>");
+
+    // A whole-agent shutdown stops the agent, which is the point of it.
+    let agent = cluster.take_agent();
+    assert_eq!(agent.finish().await, Stop::Shutdown);
+
+    cluster.stop().await;
+}
+
+/// Several nodes at once, which is what a hostlist is for. The answers come back
+/// in whatever order the nodes manage it; the operator puts them back in order.
+#[tokio::test]
+async fn an_operator_commands_several_nodes_in_one_round_trip() {
+    let counter = CounterConfig::new();
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .agents(4, {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("every agent to connect", || {
+            cluster.server().is_some_and(|s| s.stats().peers == 4)
+        })
+        .await;
+
+    let requests: Vec<Request> = (1..=4)
+        .rev() // Ask in an order the head cannot produce by accident.
+        .map(|n| Request::restart(format!("node-{n}"), Some(CounterService::NAME)))
+        .collect();
+
+    let mut operator = cluster.operator("ctl@test").await;
+    let answers = operator
+        .run(requests, Duration::from_secs(5))
+        .await
+        .expect("the head should answer");
+    operator.close().await;
+
+    let nodes: Vec<&str> = answers.iter().map(|a| a.node.as_str()).collect();
+    assert_eq!(
+        nodes,
+        vec!["node-4", "node-3", "node-2", "node-1"],
+        "answers must line up with what was asked, not with what replied first"
+    );
+    assert!(
+        answers.iter().all(cs_operator::Answer::is_ok),
+        "all four should have restarted: {answers:?}"
+    );
+
+    cluster.stop().await;
+}
+
+/// An agent is not an operator, and this is the check that says so.
+///
+/// Which endpoint the connection arrived on is the whole of the authorization, so a
+/// peer on the agents' port may name no node but itself — otherwise any compute node
+/// could restart a service on its neighbours through the head they share.
+#[tokio::test]
+async fn an_agent_cannot_command_another_node() {
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .start()
+        .await;
+
+    // Connect to the *listen* endpoint and ask for a restart on some other node.
+    let mut pretender = cluster
+        .connect_as("node-1", &TestCluster::server_endpoint())
+        .await;
+
+    let answers = pretender
+        .run(
+            vec![Request::restart("node-1", Some(CounterService::NAME))],
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("the head should still answer");
+    pretender.close().await;
+
+    let Some(Outcome::Failed(trace)) = &answers[0].outcome else {
+        panic!("expected a refusal, got {:?}", answers[0].outcome);
+    };
+    let refused = trace.to_error();
+    assert_eq!(refused.kind(), ErrorKind::Rejected);
+    assert!(
+        refused.to_string().contains("may not send commands"),
+        "the refusal should say what the rule is: {refused}"
+    );
+
+    cluster.stop().await;
+}
+
+#[test]
+fn an_admin_endpoint_without_agents_to_command_is_rejected() {
+    let err = NodeEngine::builder(MockNetwork::new().transport())
+        .config(EngineConfig::new("head01"))
+        .admin(TestCluster::admin_endpoint())
+        .build()
+        .unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::Config);
+    assert!(err.to_string().contains("accepts no agents"), "{err}");
+}
+
+#[tokio::test]
+async fn an_operator_sees_which_nodes_are_connected() {
+    let counter = CounterConfig::new();
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .agents(3, {
+            let counter = counter.clone();
+            move |agent| agent.sampler(counter.factory())
+        })
+        .start()
+        .await;
+
+    cluster
+        .wait_for("every agent to connect", || {
+            cluster.server().is_some_and(|s| s.stats().peers == 3)
+        })
+        .await;
+
+    let mut operator = cluster.operator("ctl@test").await;
+    let report = operator
+        .status(Duration::from_secs(5))
+        .await
+        .expect("the head should answer");
+    operator.close().await;
+
+    assert_eq!(report.node, "head01");
+    let names: Vec<&str> = report.nodes.iter().map(|node| node.node.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["node-1", "node-2", "node-3"],
+        "sorted, so a hostlist's worth of output is readable"
+    );
+    for node in &report.nodes {
+        assert!(node.is_direct(), "{} is attached to this head", node.node);
+        assert_eq!(node.hops, 1);
+        assert!(node.connected.is_some(), "and it knows for how long");
+        assert!(
+            node.services.iter().any(|s| s.name == CounterService::NAME),
+            "with what it runs, from its hello: {:?}",
+            node.services
+        );
+    }
+
+    cluster.stop().await;
+}
+
+/// An operator may ask; a node may not. The same privilege as routing, because a
+/// peer that can route commands could discover the same list by trying them.
+#[tokio::test]
+async fn an_agent_cannot_ask_what_the_cluster_looks_like() {
+    let cluster = TestCluster::builder()
+        .admin()
+        .server(|server| server)
+        .start()
+        .await;
+
+    let mut pretender = cluster
+        .connect_as("node-1", &TestCluster::server_endpoint())
+        .await;
+    let refused = pretender.status(Duration::from_millis(300)).await;
+    pretender.close().await;
+
+    let err = refused.expect_err("a node should get no answer");
+    assert_eq!(
+        err.kind(),
+        ErrorKind::Timeout,
+        "the request is dropped and counted, not answered: {err:?}"
+    );
+    assert_eq!(
+        cluster
+            .server()
+            .expect("a server")
+            .stats()
+            .unroutable_frames,
+        1,
+        "and it is counted, so an operator can see somebody tried"
+    );
+
+    cluster.stop().await;
 }

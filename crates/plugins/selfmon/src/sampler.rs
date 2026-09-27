@@ -247,6 +247,7 @@ fn build(held: &[Snapshot]) -> SelfmonBatch {
         bytes_sent: engine_series(held, |e| e.bytes_sent),
         bytes_received: engine_series(held, |e| e.bytes_received),
         reconnects: engine_series(held, |e| e.reconnects),
+        peer_timeouts: engine_series(held, |e| e.peer_timeouts),
         peers: engine_series(held, |e| u64::from(e.peers)),
         data_queue_depth: engine_series(held, |e| e.data_queue_depth),
         control_queue_depth: engine_series(held, |e| e.control_queue_depth),

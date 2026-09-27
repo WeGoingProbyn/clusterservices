@@ -23,6 +23,10 @@ message SelfmonBatch {
   repeated uint64 bytes_sent = 12;
   repeated uint64 bytes_received = 13;
   repeated uint64 reconnects = 14;
+  // Peers dropped for going silent. Distinct from `reconnects` on purpose: a
+  // reconnect after a clean close is ordinary, a timeout means a peer stopped
+  // answering without saying so.
+  repeated uint64 peer_timeouts = 22;
   // Peers connected right now. 0 or 1 on an agent.
   repeated uint64 peers = 15;
   repeated uint64 data_queue_depth = 16;

@@ -605,6 +605,9 @@ impl<H: Handler> ErasedHandler for HandlerEntry<H> {
             })?;
             let origin = Origin {
                 node: &from.node,
+                // The same until a tier forwards: this engine accepts data only
+                // from the peer that produced it.
+                via: &from.via,
                 service_version: from.service_version,
             };
             self.handler.handle(&self.ctx, origin, message).await
@@ -619,7 +622,10 @@ impl<H: Handler> ErasedHandler for HandlerEntry<H> {
 /// An owned [`Origin`], for a handler future that outlives the frame.
 #[derive(Clone, Debug)]
 pub(crate) struct Sender {
+    /// The node that produced the message.
     pub(crate) node: String,
+    /// The peer that delivered it. Equal to `node` until a forwarding tier exists.
+    pub(crate) via: String,
     pub(crate) service_version: u32,
 }
 

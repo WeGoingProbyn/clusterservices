@@ -66,15 +66,18 @@ impl ErrorTrace {
     pub fn to_error(&self) -> Error {
         let mut frames = self.frames.iter().rev();
         let Some(innermost) = frames.next() else {
-            return Error::new(
+            return Error::remote(
                 self.kind,
                 format!("remote error on {} with no detail", self.node),
             );
         };
 
-        let mut error = Error::new(self.kind, innermost.to_string());
+        // `Error::remote`, not `Error::new`: these frames happened on another node
+        // and each already carries its own `file:line` in its message, so claiming
+        // this line as well would print two locations for one failure.
+        let mut error = Error::remote(self.kind, innermost.to_string());
         for frame in frames {
-            error = error.context(frame.to_string());
+            error = error.remote_context(frame.to_string());
         }
         error
     }

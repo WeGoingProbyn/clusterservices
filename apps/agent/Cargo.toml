@@ -1,0 +1,44 @@
+[package]
+name = "cs-agent"
+description = "The compute-node agent: samples per-job usage and streams it upstream."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cs-agent"
+path = "src/main.rs"
+
+[dependencies]
+cs-api.workspace = true
+cs-engine.workspace = true
+cs-transport.workspace = true
+cs-util.workspace = true
+# The plugins this agent runs. Registering one is a line in `main`; removing one
+# is deleting that line.
+cs-plugin-cgroup.workspace = true
+cs-plugin-selfmon.workspace = true
+# `signal` for SIGTERM/SIGINT. A `current_thread` runtime is enough and probably
+# what you want: every blocking read already happens on its own named thread, so
+# the async side only shuffles frames — and one runtime thread instead of N looks
+# better in the agent's own selfmon output.
+tokio = { workspace = true, features = ["rt", "macros", "signal", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Rule 5: a concrete transport sits behind a feature. `tcp` is the only one that
+# exists; grpc and rdma will slot in beside it as extra arms of the match in
+# `main`, because `Transport` uses RPITIT and so cannot be boxed.
+cs-transport-tcp = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `burn`'s own tests use the fake engine, exactly as a plugin crate's would.
+cs-api = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["tcp"]
+tcp = ["dep:cs-transport-tcp"]
+
+[lints]
+workspace = true

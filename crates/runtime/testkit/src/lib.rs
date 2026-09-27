@@ -54,7 +54,7 @@ pub mod cluster;
 pub mod contract;
 pub mod plugins;
 
-pub use cluster::{Node, SERVER, TestCluster, test_config, wait_for};
+pub use cluster::{ADMIN, Node, SERVER, TestCluster, TestOperator, test_config, wait_for};
 pub use contract::TestTransport;
 pub use plugins::{
     BulkSampler, BulkService, Collect, Commander, CounterConfig, CounterSampler, CounterService,

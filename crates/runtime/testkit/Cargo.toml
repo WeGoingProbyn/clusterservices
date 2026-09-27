@@ -10,6 +10,8 @@ publish.workspace = true
 cs-api.workspace = true
 cs-async-util.workspace = true
 cs-engine.workspace = true
+# The operator client, so an engine test drives the same code `cs-ctl` does.
+cs-operator.workspace = true
 cs-transport.workspace = true
 cs-transport-mock.workspace = true
 cs-util.workspace = true

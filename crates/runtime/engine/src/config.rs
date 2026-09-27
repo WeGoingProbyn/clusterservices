@@ -84,9 +84,37 @@ pub struct EngineConfig {
     /// disables heartbeats.
     pub heartbeat_interval: Duration,
 
+    /// How long a peer may say nothing at all before its connection is dropped.
+    ///
+    /// The only defence against a **half-open connection**: a node that loses power
+    /// sends no `FIN` and no `RST`, so the socket stays open and writes keep
+    /// succeeding into nothing. Without this, a server believes that agent is
+    /// connected until TCP's keepalive notices — which defaults to a couple of
+    /// hours — and every command queued for it is delivered into the void.
+    ///
+    /// Any frame counts as proof of life, not just a heartbeat, so a busy
+    /// connection never pays for this. Zero disables it.
+    ///
+    /// Must be at least twice [`heartbeat_interval`](EngineConfig::heartbeat_interval)
+    /// so that one lost heartbeat cannot drop a healthy connection —
+    /// [`validate`](EngineConfig::validate) enforces it. Note that it is compared
+    /// against the *peer's* heartbeat interval, which this engine cannot see: a
+    /// server's timeout has to exceed what its agents are configured to send.
+    pub peer_timeout: Duration,
+
     /// How often the job list is refreshed, and therefore the freshest a
     /// sampler's view of the node can be.
     pub job_refresh: Duration,
+
+    /// How long a change in what this engine can reach may settle before it is
+    /// announced to the tier above.
+    ///
+    /// Only an engine that both listens and dials sends these at all. A relay whose
+    /// five hundred agents reconnect together would otherwise send five hundred
+    /// announcements where one, a moment later, says the same thing. Nothing depends
+    /// on the delay for correctness — every announcement carries the full current set
+    /// — so this trades a little staleness for a lot less traffic.
+    pub reachability_interval: Duration,
 
     /// Delay between reconnection attempts.
     pub reconnect: Backoff,
@@ -129,10 +157,27 @@ impl EngineConfig {
         if self.job_refresh.is_zero() {
             return Err(config_error("job_refresh must be non-zero"));
         }
+        if self.reachability_interval.is_zero() {
+            return Err(config_error("reachability_interval must be non-zero"));
+        }
         if self.max_partial_messages == 0 {
             return Err(config_error(
                 "max_partial_messages must allow at least one message",
             ));
+        }
+        if !self.peer_timeout.is_zero() {
+            if self.heartbeat_interval.is_zero() {
+                return Err(config_error(
+                    "peer_timeout needs heartbeats to be enabled, or an idle but \
+                     healthy connection would be dropped",
+                ));
+            }
+            if self.peer_timeout < self.heartbeat_interval * 2 {
+                return Err(config_error(
+                    "peer_timeout must be at least twice heartbeat_interval, so one \
+                     lost heartbeat cannot drop a healthy connection",
+                ));
+            }
         }
         Ok(())
     }
@@ -148,7 +193,10 @@ impl Default for EngineConfig {
             control_queue: 256,
             shutdown_deadline: Duration::from_secs(10),
             heartbeat_interval: Duration::from_secs(15),
+            // Three heartbeats: two may be lost before a peer is given up on.
+            peer_timeout: Duration::from_secs(45),
             job_refresh: Duration::from_secs(5),
+            reachability_interval: Duration::from_secs(5),
             reconnect: Backoff::default(),
             restart_backoff: Backoff {
                 initial: Duration::from_secs(1),
@@ -168,6 +216,24 @@ fn config_error(msg: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn heartbeats_may_be_disabled_along_with_the_timeout() {
+        // Both off is a coherent choice — no liveness checking at all.
+        let config = EngineConfig {
+            heartbeat_interval: Duration::ZERO,
+            peer_timeout: Duration::ZERO,
+            ..EngineConfig::new("node-1")
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn the_default_timeout_is_three_heartbeats() {
+        let config = EngineConfig::new("node-1");
+        assert_eq!(config.peer_timeout, config.heartbeat_interval * 3);
+        assert!(config.validate().is_ok());
+    }
 
     #[test]
     fn backoff_grows_then_stops_at_the_ceiling() {
@@ -223,6 +289,18 @@ mod tests {
             },
             EngineConfig {
                 max_partial_messages: 0,
+                ..base.clone()
+            },
+            // A timeout with nothing to keep the connection alive.
+            EngineConfig {
+                heartbeat_interval: Duration::ZERO,
+                peer_timeout: Duration::from_secs(45),
+                ..base.clone()
+            },
+            // A timeout so tight that one lost heartbeat would trip it.
+            EngineConfig {
+                heartbeat_interval: Duration::from_secs(15),
+                peer_timeout: Duration::from_secs(20),
                 ..base
             },
         ];

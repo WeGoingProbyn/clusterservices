@@ -1,0 +1,62 @@
+# The compute-node agent.
+#
+#   install -m644 cs-agent.service /etc/systemd/system/
+#   install -m644 -D agent.env.example /etc/clusterservices/agent.env
+#   $EDITOR /etc/clusterservices/agent.env
+#   systemctl enable --now cs-agent
+#
+# Nothing here is generated. What varies between nodes — which head to dial, what
+# Slurm calls this node — lives in the environment file, which is whatever
+# provisions the node's business.
+
+[Unit]
+Description=clusterservices compute-node agent
+# Job cgroups only exist once slurmd has made some, but the agent is happy to
+# start before them and find nothing, so this is an ordering hint, not a hard
+# dependency: an agent that refuses to start because slurmd is late is an agent
+# that stops reporting for the one restart you wanted to watch.
+After=network-online.target slurmd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/clusterservices/agent.env
+# CS_SERVER and CS_NODE come from the environment file. `--no-burn` because the
+# load generator is a development aid and has no business on a compute node.
+ExecStart=/usr/bin/cs-agent --no-burn
+
+# Exit 0 means an operator said `cs-ctl shutdown` and meant it, so it stays down.
+# Exit 75 means `cs-ctl restart`, or `EngineHandle::restart()`, and is the only
+# restart mechanism there is — the agent never re-executes itself.
+#
+# `on-failure` already covers 75; naming it explicitly documents the contract and
+# keeps working if `SuccessExitStatus=` is ever added.
+Restart=on-failure
+RestartForceExitStatus=75
+RestartSec=5s
+
+# The engine's own shutdown deadline is 10s and it bounds everything, including
+# the join of plugin worker threads. Leave room for it to finish tidily, then
+# insist.
+TimeoutStopSec=20s
+
+# Its own cgroup, so `cs-plugin-selfmon` measures the agent and not the node, and
+# so it is never under slurmstepd.scope, where it would look like a job.
+Slice=system.slice
+
+# Root by default. Cgroup files are world-readable on a normal Slurm node, so a
+# `User=` of your own works today — but NVML per-process attribution, which is
+# what the GPU plugin will need, generally does not.
+#
+# The agent writes nothing anywhere and only reads /sys and /proc.
+ProtectSystem=strict
+ProtectHome=yes
+ProtectControlGroups=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+RestrictSUIDSGID=yes
+# Deliberately *not* MemoryDenyWriteExecute: there is no JIT here, but the GPU
+# libraries this will load later are not so restrained.
+
+[Install]
+WantedBy=multi-user.target

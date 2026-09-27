@@ -1,0 +1,19 @@
+[package]
+name = "cs-operator"
+description = "The operator side of the command protocol: connect to a head, send commands, collect answers."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+# The traits and the frame types, never an implementation: an operator works over
+# whatever transport the head is listening on (rule 3's reasoning, applied to a
+# client rather than a transport).
+cs-transport.workspace = true
+cs-util.workspace = true
+tokio = { workspace = true, features = ["time", "macros"] }
+tracing.workspace = true
+
+[lints]
+workspace = true

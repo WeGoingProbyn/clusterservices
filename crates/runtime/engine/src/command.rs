@@ -82,6 +82,7 @@ impl Commands {
         &self,
         node: &str,
         service: &str,
+        target: &str,
         kind: CommandKind,
         force: bool,
         ttl: Duration,
@@ -99,6 +100,10 @@ impl Commands {
                 kind,
                 force,
                 ttl: (!ttl.is_zero()).then_some(ttl),
+                // Empty when the frame is going to the node it is for: the connection
+                // already says which node, and a second answer could only disagree.
+                // Set when `node` is a *child* that will pass it on further down.
+                node: target.to_owned(),
             });
             lock(&self.in_flight).insert(
                 id,
@@ -160,6 +165,7 @@ impl Commands {
                 kind: command.kind,
                 force: command.force,
                 ttl: remaining,
+                node: String::new(),
             });
             lock(&self.in_flight).insert(
                 command.id,
@@ -368,6 +374,7 @@ mod tests {
         let (handle, ready) = commands.dispatch(
             "node-7",
             "cgroup",
+            "",
             CommandKind::Restart,
             false,
             Duration::from_secs(60),
@@ -397,6 +404,7 @@ mod tests {
         let (_handle, ready) = commands.dispatch(
             "node-7",
             "cgroup",
+            "",
             CommandKind::Shutdown,
             false,
             Duration::from_secs(60),
@@ -416,6 +424,7 @@ mod tests {
             let (_h, ready) = commands.dispatch(
                 "n",
                 "s",
+                "",
                 CommandKind::Restart,
                 false,
                 Duration::ZERO,
@@ -436,6 +445,7 @@ mod tests {
         let (_handle, _) = commands.dispatch(
             "node-7",
             "cgroup",
+            "",
             CommandKind::Restart,
             false,
             Duration::from_secs(60),
@@ -462,6 +472,7 @@ mod tests {
         let (handle, _) = commands.dispatch(
             "node-7",
             "cgroup",
+            "",
             CommandKind::Restart,
             false,
             Duration::from_secs(60),
@@ -482,6 +493,7 @@ mod tests {
         let (queued, _) = commands.dispatch(
             "node-7",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::from_secs(10),
@@ -491,6 +503,7 @@ mod tests {
         let (sent, _) = commands.dispatch(
             "node-8",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::from_secs(10),
@@ -500,6 +513,7 @@ mod tests {
         let (long, _) = commands.dispatch(
             "node-9",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::from_secs(600),
@@ -525,6 +539,7 @@ mod tests {
         let (_handle, _) = commands.dispatch(
             "node-7",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -541,6 +556,7 @@ mod tests {
         let (handle, ready) = commands.dispatch(
             "node-7",
             "gpu",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -582,6 +598,7 @@ mod tests {
             let (handle, ready) = commands.dispatch(
                 "n",
                 "s",
+                "",
                 CommandKind::Restart,
                 false,
                 Duration::ZERO,
@@ -607,6 +624,7 @@ mod tests {
         let (_handle, ready) = commands.dispatch(
             "n",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -629,6 +647,7 @@ mod tests {
         let (lost, _) = commands.dispatch(
             "node-7",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -638,6 +657,7 @@ mod tests {
         let (other, _) = commands.dispatch(
             "node-8",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -662,6 +682,7 @@ mod tests {
         let (sent, _) = commands.dispatch(
             "node-7",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -671,6 +692,7 @@ mod tests {
         let (queued, _) = commands.dispatch(
             "node-8",
             "s",
+            "",
             CommandKind::Restart,
             false,
             Duration::ZERO,
@@ -695,6 +717,7 @@ mod tests {
             let _ = commands.dispatch(
                 "node-7",
                 "s",
+                "",
                 CommandKind::Restart,
                 false,
                 Duration::from_secs(60),

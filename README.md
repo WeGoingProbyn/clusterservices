@@ -15,14 +15,15 @@ that a plugin author writes business logic ("read these files, return these
 counters") and nothing else: no tokio, no sockets, no framing, no retries. Adding
 a plugin or a transport must never mean rewriting the engine.
 
-> **Status: the framework works; the plugins that use it do not exist yet.**
-> An agent samples, batches, chunks, and streams to a server that routes to
-> handlers; commands flow back with replies; outages are buffered and survived;
-> shutdown is ordered. All of that is exercised end to end over a deliberately
-> hostile in-process transport **and** over real TCP sockets, and the cgroup
-> sampler that reads per-job usage exists and is tested against a fake cgroup
-> tree. What is missing is a binary to run: no agent, no server, no CLI. See
-> [Roadmap](#roadmap).
+> **Status: it runs.** An agent samples, batches, chunks, and streams to a server
+> that routes to handlers; commands flow back with replies; outages are buffered and
+> survived; shutdown is ordered. All of that is exercised end to end over a
+> deliberately hostile in-process transport **and** over real TCP sockets. The cgroup
+> sampler that reads per-job usage is tested against a fake tree *and* against this
+> machine's real one, and `cs-agent` and `cs-server` are two processes you can start
+> today — see [Try it](#try-it), and `cs-ctl` can restart a service on a hostlist of
+> them. What is missing: the GPU plugin, storage behind the server, and a run on real
+> Slurm. See [Roadmap](#roadmap).
 
 ## Architecture
 
@@ -65,7 +66,7 @@ CommandHandle ◀── match by id ◀── CommandResult ◀── Reply ◀�
 ## Crate layout
 
 Directory names match the package name minus the `cs-` prefix. ✅ is built and
-tested; ⬜ is planned and mostly not on disk yet.
+tested; 🚧 is in progress; ⬜ is planned and mostly not on disk yet.
 
 ```
 crates/
@@ -92,6 +93,10 @@ crates/
     engine/        cs-engine       NodeEngine, peer table, lanes,      5563 loc ✅
                                    command queues, chunking,
                                    supervision, shutdown, TokioClock.
+    operator/      cs-operator     The operator side of the command     ~380 loc ✅
+                                   protocol: connect, ask, collect,
+                                   and `status`. Shared by cs-ctl and
+                                   the engine's own tier tests.
     testkit/       cs-testkit      TestCluster, misbehaving plugins,   1431 loc ✅
                                    the transport contract suite.
   plugins/
@@ -101,9 +106,13 @@ crates/
     selfmon/       cs-plugin-selfmon  Engine counters, process cost,  1571 loc ✅
                                    and CPU per plugin thread.
 apps/
-  agent/           cs-agent        registers samplers, picks a transport        ⬜
-  server/          cs-server       registers handlers, admin port               ⬜
-  ctl/             cs-ctl          operator CLI, hostlist-style --nodes         ⬜
+  agent/           cs-agent        dials a head, registers samplers,    794 loc ✅
+                                   plus `burn` to give it something
+                                   to report on a non-cluster machine
+  server/          cs-server       accepts agents and operators,        774 loc ✅
+                                   logs every batch; no storage yet
+  ctl/             cs-ctl          operator CLI: status, restart or     ~870 loc ✅
+                                   shutdown a hostlist of nodes
 ```
 
 ### Dependency rules
@@ -203,9 +212,95 @@ Use `--all-features`: `test_support` and its doctests sit behind `test-util`, an
 later transports have features of their own.
 
 External dependencies are few and deliberate: `bytes`, `prost`, `tokio`,
-`tracing`, and `protox` at build time. 370 tests, no `unsafe`, `unwrap`/`expect`
+`tracing`, and `protox` at build time. 467 tests, no `unsafe`, `unwrap`/`expect`
 denied in library code by lint — with one documented exemption for `cs-testkit`,
 whose job is to panic loudly.
+
+## Try it
+
+Two terminals, no cluster required:
+
+```sh
+cargo run -p cs-server                                      # listens on tcp://0.0.0.0:7777
+cargo run -p cs-agent -- --burn-threads 2 --burn-percent 60  # dials 127.0.0.1:7777
+```
+
+The head prints one line per batch it receives:
+
+```
+node-7 selfmon  6 samples  agent cpu +11.990s rss 40.2MiB threads 6  queue 0d/0c
+  frames 2  [burn/sample +10.0ms, burn/spin0 +5.980s, burn/spin1 +6.000s]
+```
+
+`burn` is a load generator built into the agent, there so a machine that is not a
+compute node has something to report: it spins threads on a duty cycle and sawtooths
+a ballast allocation. Its workers are named `burn/spin0`, which is why their CPU
+appears **by name** above — thread naming, per-plugin attribution, batching,
+chunking and the wire format all in one line. `--no-burn` turns it off; `--cgroups`
+adds the real per-job sampler on a node that has job cgroups.
+
+Both binaries stop on SIGTERM, flush what they were holding, and exit 0 — or exit
+75, which is what systemd's `RestartForceExitStatus=` is for.
+
+In a third terminal, ask what it can see and tell it to do something:
+
+```
+$ cs-ctl status
+head01 up 4m12s  (cs-server 0.1.0)
+node-7  direct              3m50s  selfmon/v1
+1 node
+```
+
+
+```
+$ cs-ctl restart --nodes node-[6-7] --service selfmon
+node-6  selfmon     failed:
+    no node named "node-6" is connected @ crates/runtime/engine/src/engine.rs:166
+node-7  selfmon     ok
+1 of 2 ok
+```
+
+### Three tiers
+
+A relay is an engine in both roles, so it is the same binary with an upstream:
+
+```sh
+cs-server -l tcp://0.0.0.0:7777 -n global                         # the top
+cs-server -l tcp://0.0.0.0:7777 -n relay-a --upstream tcp://global:7777
+cs-agent  --server tcp://relay-a:7777                             # a node behind it
+```
+
+The relay announces what it serves, so the global head can see and command nodes it
+has never spoken to:
+
+```
+$ cs-ctl -H tcp://global:7788 status
+global up 43s  (cs-server 0.1.0)
+relay-a  direct             42s  -
+node-1   via relay-a +1         -  selfmon/v1
+2 nodes
+
+$ cs-ctl -H tcp://global:7788 restart -n node-1 -s selfmon
+node-1  selfmon     ok
+1 of 1 ok
+```
+
+What a relay cannot do yet is carry *metrics* upward — that needs `Data.origin`, or
+the head would credit every agent's numbers to the relay. It counts and drops a batch
+it has no handler for, which is at least visible.
+
+`cs-ctl` talks to a **second** port (`tcp://127.0.0.1:7788` by default, loopback on
+purpose: reaching it is the only authorization there is). The head forwards each
+command to the node named and hands back that node's own answer — including, as
+above, the error chain from wherever it went wrong. Exit status is 0 when every node
+said ok, 1 when one did not, 2 when there was no answer to be had.
+
+## Installing it
+
+`packaging/` has systemd units for both, with the contracts spelled out in
+[`packaging/README.md`](packaging/README.md) — chiefly that **exit 75 is the restart
+mechanism** (`RestartForceExitStatus=75`) while exit 0 means an operator asked for a
+shutdown and meant it, so `Restart=always` is wrong here.
 
 ## Design decisions worth knowing
 
@@ -239,6 +334,10 @@ behavioural contracts. The decisions most likely to surprise a reader of the cod
   socket and a deliberate close both send a FIN, so no transport can tell them
   apart — an end of stream with no `Goodbye` before it means the peer went away,
   and the agent reconnects.
+- **Silence is a failure mode of its own.** A node that loses power sends no FIN
+  and no RST: writes keep succeeding into nothing and reads never return. So a peer
+  that says nothing for `peer_timeout` is dropped, and the mock can reproduce it
+  exactly (`Link::blackhole`).
 
 ## Roadmap
 
@@ -250,8 +349,9 @@ behavioural contracts. The decisions most likely to surprise a reader of the cod
 | 4 | `cs-transport-mock` | ✅ done |
 | 5 | `cs-engine` against the mock, driven by `cs-testkit` | ✅ done |
 | 6 | `cs-transport-tcp`; contract suite on both transports | ✅ done |
-| 7 | Plugins: cgroup ✅, selfmon ✅, then gpu | ← in progress |
-| 8 | Apps: agent, server, ctl | |
+| 7 | Plugins: cgroup ✅, selfmon ✅, then gpu | |
+| 8 | Apps: server ✅, agent ✅, ctl ✅ | |
+| 9 | Reachability + routing: a relay carries commands and `status` ✅ | `Data.origin` left |
 | 9 | Later: gRPC transport, relay tier, eBPF, RDMA | |
 
 Adding a transport is: implement the traits, write a `TestTransport` fixture, and

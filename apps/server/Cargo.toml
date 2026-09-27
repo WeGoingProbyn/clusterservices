@@ -1,0 +1,44 @@
+[package]
+name = "cs-server"
+description = "The cluster head: accepts agents and reports what they send."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "cs-server"
+path = "src/main.rs"
+
+[dependencies]
+cs-api.workspace = true
+cs-engine.workspace = true
+cs-transport.workspace = true
+cs-util.workspace = true
+# A handler needs the same `ServiceDef` as the sampler that feeds it — that type is
+# the shared vocabulary between the two halves of a service, so the head depends on
+# the plugin crates for it. If linking the sampling code into the head ever
+# matters, the `ServiceDef` plus its proto would split into a `-types` crate; it
+# does not matter yet.
+cs-plugin-cgroup.workspace = true
+cs-plugin-selfmon.workspace = true
+# Multi-threaded, unlike the agent: a head serves many agents and runs their
+# handlers concurrently.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Rule 5: concrete transports sit behind features.
+cs-transport-tcp = { workspace = true, optional = true }
+
+[dev-dependencies]
+# `FakeEngine` gives the handlers a context with no engine behind it.
+cs-api = { workspace = true, features = ["test-util"] }
+cs-async-util = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["tcp"]
+tcp = ["dep:cs-transport-tcp"]
+
+[lints]
+workspace = true

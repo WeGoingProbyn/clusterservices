@@ -154,6 +154,12 @@ impl FrameTx for MockTx {
         }
 
         let len = bytes.len();
+        if self.link.is_blackholed(self.direction) {
+            // Counted as sent and then dropped: a half-open connection accepts
+            // writes and delivers nothing, and the sender cannot tell.
+            self.link.count_sent(self.direction, len);
+            return Ok(());
+        }
         self.push(Wire::Bytes(bytes))
             .await
             .with_context(|| format!("sending {kind} frame {}", self.direction))?;

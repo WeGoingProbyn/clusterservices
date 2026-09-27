@@ -8,23 +8,24 @@ use cs_api::runtime::{
     CommandKind as ApiCommandKind, CommandRequest, DataSink, ServiceRuntime, WorkerHost,
 };
 use cs_api::{
-    CommandOutcome, Encodable, EngineStats, Handler, JobSource, NoJobs, Sampler, SamplerFactory,
+    CommandOutcome, Encodable, EngineStats, Handler, JobSource, Sampler, SamplerFactory,
     ServiceBound, ServiceId,
 };
 use cs_async_util::{BoxFuture, Clock, CommandHandle, ShutdownSignal, command_channel};
 use cs_transport::{
-    Capabilities, CommandKind as WireCommandKind, Connection, Endpoint, Frame, Goodbye, Listener,
-    Transport,
+    Capabilities, CommandKind as WireCommandKind, Connection, Endpoint, Frame, Goodbye, KnownNode,
+    Listener, NodeReach, Reachable, ServiceInfo, Transport,
 };
 use cs_util::{Error, ErrorKind, Result, ResultExt};
+use tokio::sync::Notify;
 use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use crate::command::Commands;
 use crate::config::EngineConfig;
 use crate::peer::{
-    Ended, LastWrite, Peer, Stop, StopRequest, Wiring, accept_hello, heartbeat_loop, our_hello,
-    read_loop, write_loop,
+    Ended, LastWrite, Peer, Role, Stop, StopRequest, Wiring, accept_hello, heartbeat_loop,
+    our_hello, read_loop, write_loop,
 };
 use crate::queue::PeerQueue;
 use crate::service::{
@@ -76,6 +77,20 @@ pub(crate) struct Inner {
     uplink: Option<Arc<PeerQueue>>,
     /// Connected peers by node name. An agent has at most one; a server has many.
     peers: Mutex<HashMap<String, Arc<Peer>>>,
+    /// What each child says it can reach, exactly as it said it.
+    ///
+    /// Kept per child rather than merged, because an announcement replaces that
+    /// child's whole contribution and there is no way to subtract a merged one.
+    announced: Mutex<HashMap<String, Vec<NodeReach>>>,
+    /// The lookup derived from `announced`: node → the child that serves it.
+    ///
+    /// Rebuilt whenever an announcement arrives, which is rare, so that dispatching
+    /// a command is one hash lookup rather than a scan of every child's list.
+    routes: Mutex<HashMap<String, Route>>,
+    /// Told when what we can reach has changed, so it can be announced upward.
+    reach_changed: Arc<Notify>,
+    /// When `run` started, for `uptime`.
+    started_at: Instant,
     /// Filled in once the registrations have been run.
     ///
     /// A `OnceLock` rather than a field, because of a genuine circularity: a
@@ -88,9 +103,129 @@ pub(crate) struct Inner {
     handlers: OnceLock<Arc<HashMap<&'static str, Arc<dyn ErasedHandler>>>>,
 }
 
+/// How to reach a node that is not connected to us.
+#[derive(Clone, Debug)]
+pub(crate) struct Route {
+    /// The child peer that serves it.
+    via: String,
+    /// How far away it is, as that child reported plus our hop.
+    hops: u32,
+    /// What it runs, if the child knew.
+    services: Vec<ServiceInfo>,
+}
+
+/// How deep a tier hierarchy this engine will believe in.
+///
+/// Not a limit anyone should reach — agent, relay, cluster head, global is four —
+/// but an announcement claiming more is a loop or a peer talking nonsense, and a
+/// routing table is not the place to find out which.
+const MAX_HOPS: u32 = 8;
+
 impl Inner {
     fn peer(&self, node: &str) -> Option<Arc<Peer>> {
         lock(&self.peers).get(node).cloned()
+    }
+
+    /// Where a node that is not directly connected can be found.
+    fn route(&self, node: &str) -> Option<Route> {
+        lock(&self.routes).get(node).cloned()
+    }
+
+    /// Queue or send one command, and return the handle its answer will resolve.
+    ///
+    /// `hop` is the peer the frame is written to and the name the in-flight entry is
+    /// keyed on — the node itself, or the child that serves it. `target` is what goes
+    /// in the frame: empty when the frame is going to the node it is for.
+    fn send_command(
+        &self,
+        request: &Forwarded<'_>,
+        hop: &str,
+        target: &str,
+        peer: Option<&Arc<Peer>>,
+    ) -> CommandHandle<CommandOutcome> {
+        let (handle, ready) = self.commands.dispatch(
+            hop,
+            request.service,
+            target,
+            request.kind.clone(),
+            request.force,
+            request.expiry,
+            self.clock.now(),
+            peer.is_some(),
+        );
+        if let (Some(peer), Some(ready)) = (peer, ready) {
+            if let Err(err) = peer.queue.push_control(ready.frame) {
+                warn!(node = hop, error = ?err, "cannot queue a command");
+            }
+        }
+        handle
+    }
+
+    /// Rebuild the flat routing table from what the children have announced.
+    ///
+    /// Two children claiming the same node is a real misconfiguration — a node
+    /// connected to two relays — so the nearer one wins and the collision is said
+    /// out loud rather than resolved silently.
+    fn rebuild_routes(&self) {
+        let announced = lock(&self.announced);
+        let mut routes: HashMap<String, Route> = HashMap::new();
+
+        for (child, nodes) in announced.iter() {
+            for reach in nodes {
+                if reach.hops >= MAX_HOPS {
+                    warn!(
+                        via = %child,
+                        node = %reach.node,
+                        hops = reach.hops,
+                        "ignoring a node too many tiers away to be real"
+                    );
+                    continue;
+                }
+                // Our own name arriving from below would be a loop, and routing to it
+                // would send a command in a circle.
+                if reach.node == self.config.node {
+                    warn!(via = %child, "a child claims to reach us; ignoring it");
+                    continue;
+                }
+                let hops = reach.hops.saturating_add(1);
+                match routes.get(&reach.node) {
+                    Some(existing) if existing.hops <= hops => {
+                        warn!(
+                            node = %reach.node,
+                            kept = %existing.via,
+                            ignored = %child,
+                            "two children claim the same node"
+                        );
+                    }
+                    _ => {
+                        routes.insert(
+                            reach.node.clone(),
+                            Route {
+                                via: child.clone(),
+                                hops,
+                                services: reach.services.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+
+        let count = routes.len();
+        *lock(&self.routes) = routes;
+        drop(announced);
+        debug!(count, "rebuilt the routing table");
+        self.reach_changed.notify_one();
+    }
+
+    /// Forget everything a peer announced, and note that our own set changed.
+    fn forget(&self, child: &str) {
+        let had = lock(&self.announced).remove(child).is_some();
+        if had {
+            self.rebuild_routes();
+        } else {
+            self.reach_changed.notify_one();
+        }
     }
 
     fn services(&self) -> Arc<HashMap<&'static str, ServiceHandle>> {
@@ -129,6 +264,168 @@ impl WorkerHost for Inner {
     }
 }
 
+/// The engine's routing knowledge, as a connection's tasks see it.
+///
+/// A trait rather than a field so that a connection reaches the engine through a
+/// named, minimal surface — the same reason [`Wiring`] exists. Implemented by
+/// [`Inner`], and it is the whole of what a tier needs to serve the one below it.
+pub(crate) trait Routing: Send + Sync + 'static {
+    /// Send a command to `node` — directly, through the child that serves it, or by
+    /// queueing it until that node reconnects.
+    ///
+    /// `Err` when there is no route and `queue` is false.
+    fn dispatch(&self, request: Forwarded<'_>) -> Result<CommandHandle<CommandOutcome>>;
+
+    /// Record what a child says it can reach, **replacing** whatever it said before.
+    ///
+    /// An empty set removes the child's entries: that is how the last agent behind a
+    /// relay is retired, and why announcements carry the full set.
+    fn record_reachable(&self, child: &str, nodes: Vec<NodeReach>);
+
+    /// Every node this engine can reach, direct first, for an operator to read.
+    fn known_nodes(&self) -> Vec<KnownNode>;
+
+    /// Nodes below us, as announced to the tier above: our children at one hop, and
+    /// everything they reach one hop further.
+    fn reachable(&self) -> Vec<NodeReach>;
+
+    /// How long this engine has been running.
+    fn uptime(&self) -> Duration;
+}
+
+/// One command on its way to a node this engine serves.
+pub(crate) struct Forwarded<'a> {
+    pub(crate) node: &'a str,
+    /// Empty for a whole-agent command.
+    pub(crate) service: &'a str,
+    pub(crate) kind: WireCommandKind,
+    pub(crate) force: bool,
+    pub(crate) expiry: Duration,
+    /// Whether to hold the command for a node that is not connected.
+    ///
+    /// True for a server-side handler, whose command is automation and can wait.
+    /// False for an operator, who is a person watching a terminal: a command
+    /// delivered in twenty minutes when the node reboots is a surprise, not a
+    /// feature, and "node-7 is not connected" is the answer they wanted.
+    pub(crate) queue: bool,
+}
+
+impl Routing for Inner {
+    fn dispatch(&self, request: Forwarded<'_>) -> Result<CommandHandle<CommandOutcome>> {
+        // Directly connected: the ordinary case, and the frame names no node because
+        // the connection already does.
+        if let Some(peer) = self.peer(request.node) {
+            // The node told us what it runs in its `Hello`, so a command for a
+            // service it does not have is refused here rather than after a round trip.
+            if !request.service.is_empty() && !peer.runs(request.service) {
+                let (answer, handle) = command_channel();
+                answer.complete(CommandOutcome::UnknownService);
+                return Ok(handle);
+            }
+            return Ok(self.send_command(&request, request.node, "", Some(&peer)));
+        }
+
+        // Behind a child that announced it. The frame keeps the target's name, which
+        // is how the child knows to pass it on instead of running it; the in-flight
+        // entry is keyed on the *child*, so a child that disconnects abandons it
+        // rather than leaving it waiting for a node it can no longer reach.
+        if let Some(route) = self.route(request.node) {
+            if let Some(child) = self.peer(&route.via) {
+                debug!(
+                    node = request.node,
+                    via = %route.via,
+                    hops = route.hops,
+                    "routing a command through a child"
+                );
+                return Ok(self.send_command(&request, &route.via, request.node, Some(&child)));
+            }
+            // The table said one thing and the peer table another. Not worth an error
+            // of its own: fall through to "no route", which is what it amounts to.
+            warn!(
+                node = request.node,
+                via = %route.via,
+                "a route points at a child that is not connected"
+            );
+        }
+
+        if !request.queue {
+            return Err(Error::new(
+                ErrorKind::Rejected,
+                format!("no route to a node named {:?}", request.node),
+            ));
+        }
+        // Not connected and worth waiting for: queued under its own name, to go out
+        // with its remaining time to live recomputed when it reconnects.
+        Ok(self.send_command(&request, request.node, "", None))
+    }
+
+    fn record_reachable(&self, child: &str, nodes: Vec<NodeReach>) {
+        {
+            let mut announced = lock(&self.announced);
+            if nodes.is_empty() {
+                announced.remove(child);
+            } else {
+                announced.insert(child.to_owned(), nodes);
+            }
+        }
+        self.rebuild_routes();
+    }
+
+    fn known_nodes(&self) -> Vec<KnownNode> {
+        let now = self.clock.now();
+        let mut known: Vec<KnownNode> = lock(&self.peers)
+            .values()
+            .filter(|peer| peer.role.is_below())
+            .map(|peer| {
+                KnownNode::direct(
+                    &peer.node,
+                    peer.endpoint.as_str(),
+                    now.saturating_duration_since(peer.connected_at),
+                )
+                .running(peer.services.clone())
+            })
+            .collect();
+        known.sort_unstable_by(|a, b| a.node.cmp(&b.node));
+
+        let mut indirect: Vec<KnownNode> = lock(&self.routes)
+            .iter()
+            .map(|(node, route)| {
+                KnownNode::behind(node, &route.via, route.hops).running(route.services.clone())
+            })
+            .collect();
+        indirect.sort_unstable_by_key(|node| (node.hops, node.node.clone()));
+
+        known.extend(indirect);
+        known
+    }
+
+    fn reachable(&self) -> Vec<NodeReach> {
+        let mut nodes: Vec<NodeReach> = lock(&self.peers)
+            .values()
+            .filter(|peer| peer.role.is_below())
+            .map(|peer| NodeReach::new(&peer.node, 1).running(peer.services.clone()))
+            .collect();
+
+        // Everything our children reach, one hop further away. Bounded, so a loop or
+        // a peer talking nonsense cannot grow this without end.
+        nodes.extend(
+            lock(&self.routes)
+                .iter()
+                .filter(|(_, route)| route.hops < MAX_HOPS)
+                .map(|(node, route)| {
+                    NodeReach::new(node, route.hops.saturating_add(1))
+                        .running(route.services.clone())
+                }),
+        );
+        nodes.sort_unstable_by(|a, b| a.node.cmp(&b.node));
+        nodes
+    }
+
+    fn uptime(&self) -> Duration {
+        self.clock.now().saturating_duration_since(self.started_at)
+    }
+}
+
 impl ServiceRuntime for Inner {
     fn node(&self) -> &str {
         &self.config.node
@@ -157,33 +454,25 @@ impl ServiceRuntime for Inner {
         } else {
             request.service.name
         };
-        let peer = self.peer(request.node);
 
-        // The node told us what it runs in its `Hello`, so a command for a service
-        // it does not have is refused here rather than after a round trip.
-        if let Some(connected) = &peer {
-            if !service.is_empty() && !connected.runs(service) {
-                let (answer, handle) = command_channel();
-                answer.complete(CommandOutcome::UnknownService);
-                return handle;
-            }
-        }
-
-        let (handle, ready) = self.commands.dispatch(
-            request.node,
-            service,
-            kind,
-            request.opts.force,
-            request.opts.expiry,
-            self.clock.now(),
-            peer.is_some(),
-        );
-        if let (Some(peer), Some(ready)) = (peer, ready) {
-            if let Err(err) = peer.queue.push_control(ready.frame) {
-                warn!(node = request.node, error = ?err, "cannot queue a command");
-            }
-        }
-        handle
+        // A handler's command is queued for a node that is away, so this cannot
+        // fail and the `Result` is not one a plugin has to think about.
+        Routing::dispatch(
+            self,
+            Forwarded {
+                node: request.node,
+                service,
+                kind,
+                force: request.opts.force,
+                expiry: request.opts.expiry,
+                queue: true,
+            },
+        )
+        .unwrap_or_else(|err| {
+            let (answer, handle) = command_channel();
+            answer.fail(err);
+            handle
+        })
     }
 }
 
@@ -194,11 +483,14 @@ pub struct EngineBuilder<T: Transport> {
     transport: T,
     config: EngineConfig,
     clock: Arc<dyn Clock>,
-    job_source: Arc<dyn JobSource>,
+    /// `None` until `.jobs()` is called, which is also how the engine knows not
+    /// to start a scanner that would find nothing.
+    job_source: Option<Arc<dyn JobSource>>,
     samplers: Vec<(ServiceId, SamplerRegistration)>,
     handlers: Vec<(ServiceId, HandlerRegistration)>,
     dial: Option<Endpoint>,
     listen: Option<Endpoint>,
+    admin: Option<Endpoint>,
 }
 
 impl<T: Transport> EngineBuilder<T> {
@@ -231,10 +523,14 @@ impl<T: Transport> EngineBuilder<T> {
         self
     }
 
-    /// Where the job list comes from. Defaults to [`NoJobs`].
+    /// Where the job list comes from.
+    ///
+    /// Not called means no jobs, which is not the same as an empty list from a
+    /// source: the periodic scan is never started at all. A head has no use for it,
+    /// and neither does an agent running only plugins that ignore the job list.
     #[must_use]
     pub fn jobs(mut self, source: impl JobSource) -> Self {
-        self.job_source = Arc::new(source);
+        self.job_source = Some(Arc::new(source));
         self
     }
 
@@ -277,6 +573,22 @@ impl<T: Transport> EngineBuilder<T> {
         self
     }
 
+    /// Accept *operators* here, on a second endpoint.
+    ///
+    /// A peer that arrives on this endpoint may send commands naming any node this
+    /// engine serves, and they are forwarded to it; a peer on the ordinary
+    /// [`listen`](EngineBuilder::listen) endpoint may not. **Which port you reached
+    /// is the whole of the authorization**, which is why it is a separate endpoint
+    /// and not a flag in `Hello`: there is no authentication anywhere in this
+    /// protocol yet, so the only control an operator has over who may restart a
+    /// thousand nodes is what the admin endpoint is bound to. Bind it to loopback,
+    /// or to a management interface.
+    #[must_use]
+    pub fn admin(mut self, endpoint: Endpoint) -> Self {
+        self.admin = Some(endpoint);
+        self
+    }
+
     /// Check everything and build.
     ///
     /// Fails for anything that would otherwise go wrong much later and less
@@ -300,6 +612,12 @@ impl<T: Transport> EngineBuilder<T> {
             }
         }
 
+        if self.admin.is_some() && self.listen.is_none() {
+            return Err(Error::new(
+                ErrorKind::Config,
+                "an admin endpoint has nothing to command: this engine accepts no agents",
+            ));
+        }
         if self.dial.is_none() && self.listen.is_none() {
             return Err(Error::new(
                 ErrorKind::Config,
@@ -341,6 +659,7 @@ impl<T: Transport> EngineBuilder<T> {
             handlers: self.handlers,
             dial: self.dial,
             listen: self.listen,
+            admin: self.admin,
             counters,
             uplink,
             capabilities,
@@ -360,11 +679,12 @@ pub struct NodeEngine<T: Transport> {
     listening: Arc<Mutex<Option<Endpoint>>>,
     config: Arc<EngineConfig>,
     clock: Arc<dyn Clock>,
-    job_source: Arc<dyn JobSource>,
+    job_source: Option<Arc<dyn JobSource>>,
     samplers: Vec<(ServiceId, SamplerRegistration)>,
     handlers: Vec<(ServiceId, HandlerRegistration)>,
     dial: Option<Endpoint>,
     listen: Option<Endpoint>,
+    admin: Option<Endpoint>,
     counters: SharedCounters,
     uplink: Option<Arc<PeerQueue>>,
     capabilities: Capabilities,
@@ -380,11 +700,12 @@ impl<T: Transport> NodeEngine<T> {
             transport,
             config: EngineConfig::default(),
             clock: Arc::new(TokioClock),
-            job_source: Arc::new(NoJobs),
+            job_source: None,
             samplers: Vec::new(),
             handlers: Vec::new(),
             dial: None,
             listen: None,
+            admin: None,
         }
     }
 
@@ -415,6 +736,10 @@ impl<T: Transport> NodeEngine<T> {
             jobs: Jobs::default(),
             uplink: self.uplink.clone(),
             peers: Mutex::new(HashMap::new()),
+            announced: Mutex::new(HashMap::new()),
+            routes: Mutex::new(HashMap::new()),
+            reach_changed: Arc::new(Notify::new()),
+            started_at: self.clock.now(),
             services: OnceLock::new(),
             handlers: OnceLock::new(),
         });
@@ -447,6 +772,7 @@ impl<T: Transport> NodeEngine<T> {
         let _ = inner.handlers.set(Arc::new(handlers));
 
         let wiring = Wiring {
+            routing: Arc::clone(&inner) as Arc<dyn Routing>,
             config: Arc::clone(&self.config),
             counters: Arc::clone(&self.counters),
             commands: Arc::clone(&inner.commands),
@@ -467,13 +793,30 @@ impl<T: Transport> NodeEngine<T> {
         for driver in drivers {
             service_tasks.spawn(driver);
         }
-        if !wiring.services.is_empty() {
+        // Only when something asked for jobs *and* there is a service to hand them
+        // to. Otherwise this is a named thread and a timer per node, waking up to
+        // enumerate nothing — which is exactly the kind of waste `selfmon` exists
+        // to make visible, and it showed up there the first time an agent ran.
+        if let Some(source) = self
+            .job_source
+            .clone()
+            .filter(|_| !wiring.services.is_empty())
+        {
             service_tasks.spawn(refresh_jobs(
-                Arc::clone(&self.job_source),
+                source,
                 inner.jobs.clone(),
                 Arc::clone(&self.clock),
                 self.shutdown.clone(),
                 self.config.job_refresh,
+            ));
+        }
+        // Only a tier in the middle has anything to announce: children to report, and
+        // a parent to report them to.
+        if self.dial.is_some() && self.listen.is_some() {
+            service_tasks.spawn(announce_reachability(
+                Arc::clone(&inner),
+                self.shutdown.clone(),
+                self.config.reachability_interval,
             ));
         }
         service_tasks.spawn(sweep_commands(
@@ -490,6 +833,22 @@ impl<T: Transport> NodeEngine<T> {
                 wiring.clone(),
             ));
         }
+        if let Some(endpoint) = self.admin.clone() {
+            let listener = self
+                .transport
+                .listen(&endpoint)
+                .await
+                .with_context(|| format!("listening for operators on {endpoint}"))?;
+            let bound = listener.local_endpoint().unwrap_or(endpoint);
+            info!(endpoint = %bound, "accepting operators");
+            link_tasks.spawn(accept_loop(
+                listener,
+                Arc::clone(&inner),
+                wiring.clone(),
+                Role::Operator,
+            ));
+        }
+
         if let Some(endpoint) = self.listen.clone() {
             let listener = self
                 .transport
@@ -502,7 +861,12 @@ impl<T: Transport> NodeEngine<T> {
             let bound = listener.local_endpoint().unwrap_or(endpoint);
             info!(endpoint = %bound, transport = self.capabilities.name, "listening");
             *lock(&self.listening) = Some(bound);
-            link_tasks.spawn(accept_loop(listener, Arc::clone(&inner), wiring.clone()));
+            link_tasks.spawn(accept_loop(
+                listener,
+                Arc::clone(&inner),
+                wiring.clone(),
+                Role::Node,
+            ));
         }
 
         info!(
@@ -541,6 +905,7 @@ impl<T: Transport> std::fmt::Debug for NodeEngine<T> {
             .field("handlers", &self.handlers.len())
             .field("dial", &self.dial)
             .field("listen", &self.listen)
+            .field("admin", &self.admin)
             .finish()
     }
 }
@@ -706,6 +1071,42 @@ impl EngineHandle {
     }
 }
 
+/// Tell the tier above what we can reach, whenever that changes.
+///
+/// Only started by an engine that both listens and dials — a relay, or a cluster
+/// head under a global tier. A leaf agent serves nobody and its name is already in
+/// its `Hello`.
+async fn announce_reachability(inner: Arc<Inner>, shutdown: ShutdownSignal, settle: Duration) {
+    let Some(uplink) = inner.uplink.clone() else {
+        return;
+    };
+
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.wait() => return,
+            () = inner.reach_changed.notified() => {}
+        }
+
+        // Let a burst settle — five hundred agents reconnecting is one change, not
+        // five hundred — and then send the full current set.
+        let quiet = inner.clock.sleep(settle);
+        tokio::select! {
+            biased;
+            () = shutdown.wait() => return,
+            () = quiet => {}
+        }
+
+        let nodes = inner.reachable();
+        debug!(count = nodes.len(), "announcing what we can reach");
+        if let Err(err) = uplink.push_control(Frame::Reachable(Reachable::new(nodes))) {
+            // The queue is closed, which means the engine is stopping.
+            debug!(error = ?err, "cannot announce reachability");
+            return;
+        }
+    }
+}
+
 /// Keep the shared job list fresh.
 async fn refresh_jobs(
     source: Arc<dyn JobSource>,
@@ -810,7 +1211,12 @@ async fn dial_loop<T: Transport>(
                 info!(%endpoint, "connected upstream");
 
                 let ended = serve_upstream(connection, &inner, &wiring, &endpoint).await;
-                info!(%endpoint, ?ended, "upstream connection ended");
+                match &ended {
+                    Ended::Silent(after) => {
+                        warn!(%endpoint, ?after, "upstream went silent; reconnecting")
+                    }
+                    other => info!(%endpoint, ended = ?other, "upstream connection ended"),
+                }
                 if !ended.should_reconnect() {
                     return;
                 }
@@ -840,6 +1246,11 @@ async fn serve_upstream<C: Connection>(
         endpoint.clone(),
         Arc::clone(&uplink),
         Vec::new(),
+        // The tier above us. Its commands may name any node we serve, which is how
+        // one reaches a node behind a relay; trusted by construction, because we
+        // chose to dial it.
+        Role::Upstream,
+        wiring.clock.now(),
     ));
 
     // Hello goes first, ahead of every batch that was waiting.
@@ -847,6 +1258,10 @@ async fn serve_upstream<C: Connection>(
     {
         return Ended::Broken(err);
     }
+    // And then, if we serve anyone, what we can reach — because `drop_control` above
+    // has just discarded any announcement queued for the connection that died, which
+    // is right: it would have been stale by now.
+    inner.reach_changed.notify_one();
 
     lock(&inner.peers).insert(peer.node.clone(), Arc::clone(&peer));
     inner.counters.connected.store(true, Ordering::Relaxed);
@@ -860,8 +1275,8 @@ async fn serve_upstream<C: Connection>(
     ended
 }
 
-/// Accept agents until the engine stops.
-async fn accept_loop<L: Listener>(listener: L, inner: Arc<Inner>, wiring: Wiring) {
+/// Accept peers of one kind until the engine stops.
+async fn accept_loop<L: Listener>(listener: L, inner: Arc<Inner>, wiring: Wiring, role: Role) {
     let mut connections: JoinSet<()> = JoinSet::new();
 
     loop {
@@ -874,7 +1289,12 @@ async fn accept_loop<L: Listener>(listener: L, inner: Arc<Inner>, wiring: Wiring
 
         match accepted {
             Ok(connection) => {
-                connections.spawn(serve_agent(connection, Arc::clone(&inner), wiring.clone()));
+                connections.spawn(serve_peer(
+                    connection,
+                    Arc::clone(&inner),
+                    wiring.clone(),
+                    role,
+                ));
             }
             Err(err) => {
                 warn!(error = ?err, "cannot accept a connection");
@@ -890,12 +1310,13 @@ async fn accept_loop<L: Listener>(listener: L, inner: Arc<Inner>, wiring: Wiring
 }
 
 /// Run one agent's connection to its end.
-async fn serve_agent<C: Connection>(connection: C, inner: Arc<Inner>, wiring: Wiring) {
+async fn serve_peer<C: Connection>(connection: C, inner: Arc<Inner>, wiring: Wiring, role: Role) {
     let remote = connection.peer();
     let (tx, mut rx) = connection.split();
 
-    // An agent must introduce itself before anything else, so the server knows
-    // which node it is talking to before it accepts any data.
+    // Every peer introduces itself before anything else: a node so its data can be
+    // attributed and commands addressed back to it, an operator so the log says who
+    // restarted a rack.
     let hello = match accept_hello(&mut rx).await {
         Ok(hello) => hello,
         Err(err) => {
@@ -906,7 +1327,6 @@ async fn serve_agent<C: Connection>(connection: C, inner: Arc<Inner>, wiring: Wi
         }
     };
     let node = hello.node.clone();
-    info!(%remote, node = %node, services = hello.services.len(), "agent connected");
 
     let queue = Arc::new(PeerQueue::new(
         wiring.config.data_queue,
@@ -915,10 +1335,25 @@ async fn serve_agent<C: Connection>(connection: C, inner: Arc<Inner>, wiring: Wi
     ));
     let peer = Arc::new(Peer::new(
         node.clone(),
-        remote,
+        remote.clone(),
         Arc::clone(&queue),
         hello.services,
+        role,
+        wiring.clock.now(),
     ));
+
+    if role == Role::Operator {
+        // Deliberately *not* in the peer table. An operator is not a node: nothing
+        // is addressed to it by name, it produces no data, and two operators on one
+        // host would otherwise collide on a name and evict each other.
+        info!(%remote, operator = %node, "operator connected");
+        let ended = run_connection_halves(tx, rx, Arc::clone(&peer), wiring).await;
+        info!(operator = %node, ended = ?ended, "operator disconnected");
+        queue.abort();
+        return;
+    }
+
+    info!(%remote, node = %node, services = peer.services.len(), "agent connected");
 
     // Anything queued while this node was away goes out now, with its remaining
     // time to live recomputed.
@@ -935,9 +1370,16 @@ async fn serve_agent<C: Connection>(connection: C, inner: Arc<Inner>, wiring: Wi
         inner.counters.peers.store(count as u64, Ordering::Relaxed);
         inner.counters.connected.store(count > 0, Ordering::Relaxed);
     }
+    // One more node below us, which the tier above may need to know.
+    inner.reach_changed.notify_one();
 
     let ended = run_connection_halves(tx, rx, Arc::clone(&peer), wiring.clone()).await;
-    info!(node = %node, ?ended, "agent disconnected");
+    match &ended {
+        // Worth saying loudly: the node did not disconnect, it stopped answering,
+        // which is what a powered-off machine looks like from here.
+        Ended::Silent(after) => warn!(node = %node, ?after, "agent went silent"),
+        other => info!(node = %node, ended = ?other, "agent disconnected"),
+    }
 
     {
         let mut peers = lock(&inner.peers);
@@ -946,6 +1388,9 @@ async fn serve_agent<C: Connection>(connection: C, inner: Arc<Inner>, wiring: Wi
         inner.counters.peers.store(count as u64, Ordering::Relaxed);
         inner.counters.connected.store(count > 0, Ordering::Relaxed);
     }
+    // Whatever this peer said it could reach, it cannot any more. Dropping its
+    // announcements is the whole reason they are kept per child.
+    inner.forget(&node);
     queue.abort();
     // A command whose result never arrived may or may not have been carried out,
     // so it is failed rather than silently retried.

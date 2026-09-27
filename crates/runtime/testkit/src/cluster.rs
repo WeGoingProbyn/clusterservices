@@ -5,12 +5,19 @@ use std::time::{Duration, Instant};
 
 use cs_api::EngineStats;
 use cs_engine::{Backoff, EngineBuilder, EngineConfig, EngineHandle, NodeEngine, Stop};
+use cs_operator::Operator;
 use cs_transport::Endpoint;
-use cs_transport_mock::{Link, MockNetwork, MockTransport};
+use cs_transport_mock::{Link, MockNetwork, MockRx, MockTransport, MockTx};
 use cs_util::Result;
 
 /// The name the cluster's server listens under.
 pub const SERVER: &str = "server";
+
+/// The name the cluster's server accepts operators under.
+pub const ADMIN: &str = "admin";
+
+/// An operator connected to the test cluster's admin endpoint.
+pub type TestOperator = Operator<MockTx, MockRx>;
 
 /// How long [`TestCluster::wait_for`] waits before giving up.
 const PATIENCE: Duration = Duration::from_secs(10);
@@ -22,7 +29,10 @@ const PATIENCE: Duration = Duration::from_secs(10);
 #[must_use]
 pub fn test_config(node: &str) -> EngineConfig {
     EngineConfig {
-        heartbeat_interval: Duration::from_millis(50),
+        heartbeat_interval: Duration::from_millis(20),
+        // Three heartbeats, as in production — short enough that a test can watch a
+        // peer be given up on without waiting.
+        peer_timeout: Duration::from_millis(60),
         job_refresh: Duration::from_millis(20),
         shutdown_deadline: Duration::from_secs(5),
         reconnect: Backoff {
@@ -130,6 +140,7 @@ pub struct ClusterBuilder {
     network: MockNetwork,
     server: Option<Configure>,
     agents: Vec<(String, Configure)>,
+    admin: bool,
 }
 
 /// Adds plugins to one engine under construction.
@@ -143,13 +154,62 @@ impl TestCluster {
             network: MockNetwork::new(),
             server: None,
             agents: Vec::new(),
+            admin: false,
         }
     }
 
-    /// The endpoint the server listens on.
+    /// Where the cluster's server listens.
     #[must_use]
     pub fn server_endpoint() -> Endpoint {
         MockNetwork::endpoint(SERVER)
+    }
+
+    /// Where the cluster's server accepts operators.
+    #[must_use]
+    pub fn admin_endpoint() -> Endpoint {
+        MockNetwork::endpoint(ADMIN)
+    }
+
+    /// Connect an operator to the cluster's admin endpoint.
+    ///
+    /// Its heartbeat is set to match [`test_config`]'s timings: a head there gives
+    /// up on a peer that has been silent for 60ms, and an operator waiting for an
+    /// answer is silent.
+    ///
+    /// # Panics
+    ///
+    /// If the cluster was not built with [`ClusterBuilder::admin`], or the
+    /// connection fails — either way, a mistake in the test.
+    pub async fn operator(&self, name: &str) -> TestOperator {
+        self.connect_as(name, &Self::admin_endpoint()).await
+    }
+
+    /// Connect to any of the cluster's endpoints as `name`.
+    ///
+    /// For the test that checks an *agent* cannot command another node: same client,
+    /// wrong door.
+    ///
+    /// Retries while the endpoint refuses, because the engines are tasks and a
+    /// listener binds when its task first runs — a connect immediately after
+    /// [`ClusterBuilder::start`] can beat it there.
+    ///
+    /// # Panics
+    ///
+    /// If nothing is listening within [`PATIENCE`].
+    pub async fn connect_as(&self, name: &str, at: &Endpoint) -> TestOperator {
+        let give_up = Instant::now() + PATIENCE;
+        loop {
+            match cs_operator::connect(&self.network.transport(), at, name).await {
+                Ok(operator) => return operator.with_heartbeat(Duration::from_millis(10)),
+                Err(err) => {
+                    assert!(
+                        Instant::now() < give_up,
+                        "nothing accepted a connection at {at}: {err:?}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
     }
 
     /// The network under the cluster, for breaking things.
@@ -257,6 +317,13 @@ impl TestCluster {
 }
 
 impl ClusterBuilder {
+    /// Also accept operators, so [`TestCluster::operator`] can connect.
+    #[must_use]
+    pub fn admin(mut self) -> Self {
+        self.admin = true;
+        self
+    }
+
     /// Add the server, configuring its handlers.
     #[must_use]
     pub fn server(
@@ -318,10 +385,14 @@ impl ClusterBuilder {
     pub async fn start(self) -> TestCluster {
         let at = TestCluster::server_endpoint();
 
+        let admin = self.admin;
         let server = self.server.map(|configure| {
-            let builder = NodeEngine::builder(self.network.transport())
+            let mut builder = NodeEngine::builder(self.network.transport())
                 .config(test_config("head01"))
                 .listen(at.clone());
+            if admin {
+                builder = builder.admin(TestCluster::admin_endpoint());
+            }
             let engine = configure(builder).build().expect("the server should build");
             spawn("head01", engine)
         });

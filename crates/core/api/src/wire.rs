@@ -91,6 +91,13 @@ impl<T: Wire> Encodable for T {
     }
 }
 
+/// A message type with no values, for a kind of message a service does not have.
+///
+/// Named through [`NoCommand`] or [`NoData`] at the point of use, which is what
+/// each of them means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Never {}
+
 /// The command type of a service that takes no custom commands.
 ///
 /// Uninhabited, so `Command::Custom(..)` cannot be constructed for such a
@@ -106,10 +113,18 @@ impl<T: Wire> Encodable for T {
 ///     Command::Custom(never) => match never {},
 /// }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum NoCommand {}
+pub type NoCommand = Never;
 
-impl Wire for NoCommand {
+/// The data type of a service that sends nothing upstream.
+///
+/// A `Vec<NoData>` can only ever be empty, so a sampler declaring it has promised
+/// silence in a way the compiler checks. That is not a degenerate case: a service
+/// whose whole effect is local — a load generator, a watchdog poking at something
+/// else, a plugin that only accepts commands — has a real reason to exist and
+/// nothing to say, and the alternative is an empty message type nobody decodes.
+pub type NoData = Never;
+
+impl Wire for Never {
     fn encoded_len(&self) -> usize {
         match *self {}
     }
@@ -121,12 +136,12 @@ impl Wire for NoCommand {
     fn decode(_buf: Bytes) -> Result<Self> {
         Err(Error::new(
             ErrorKind::Decode,
-            "service accepts no custom commands",
+            "this service has no message of that kind",
         ))
     }
 }
 
-impl std::fmt::Display for NoCommand {
+impl std::fmt::Display for Never {
     fn fmt(&self, _f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {}
     }
@@ -135,6 +150,7 @@ impl std::fmt::Display for NoCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::NoData;
     use bytes::BytesMut;
 
     /// Round-trip through the `&mut dyn BufMut` path a transport would use.
@@ -201,5 +217,13 @@ mod tests {
     fn no_command_is_uninhabited() {
         assert_eq!(size_of::<NoCommand>(), 0);
         assert_eq!(size_of::<Option<NoCommand>>(), 0);
+    }
+
+    /// The property the whole point of [`NoData`] rests on.
+    #[test]
+    fn a_vec_of_no_data_can_only_be_empty() {
+        let sent: Vec<NoData> = Vec::new();
+        assert!(sent.is_empty());
+        // And there is no expression of type `NoData` to push into it.
     }
 }

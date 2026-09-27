@@ -33,6 +33,12 @@ message Frame {
     CommandResult command_result = 5;
     // Liveness only.
     Heartbeat heartbeat = 6;
+    // Which nodes the sender can reach, sent upward by a tier that serves others.
+    Reachable reachable = 7;
+    // Ask a peer what it knows.
+    Status status = 8;
+    // The answer to exactly one Status.
+    StatusReport status_report = 9;
   }
 }
 
@@ -121,6 +127,12 @@ message Command {
   uint64 ttl_ms = 5;
   // The service's own encoded command. Set only for COMMAND_KIND_CUSTOM.
   bytes payload = 6;
+  // Which node this is for, when that is not the peer it is being sent to.
+  //
+  // Empty on the server -> agent hop, where the target is whoever the frame is
+  // addressed to and naming it again could only disagree. Set by an operator or
+  // by a tier forwarding downward, which must say which node it means.
+  string node = 7;
 }
 
 // Which command is being issued.
@@ -187,6 +199,78 @@ message TraceFrame {
   string file = 2;
   // Line in `file`. 0 when `file` is empty.
   uint32 line = 3;
+}
+
+// Which nodes the sender can reach, besides itself.
+//
+// Sent upward, on connecting and whenever the set changes. A leaf agent never
+// sends one: its own name is in its `Hello` and it serves nobody.
+//
+// **Always the full current set, never a delta**, for the same reason command TTLs
+// are relative rather than absolute: state that can drift between two peers is
+// state that will. A parent replaces everything it knew about this child on every
+// announcement, so a missed frame costs a moment of staleness rather than a
+// permanently wrong table.
+message Reachable {
+  // Every node below the sender. Empty is meaningful: it says "I serve nobody
+  // now", which is how the last agent behind a relay is retired.
+  repeated NodeReach nodes = 1;
+}
+
+// One node somebody can reach.
+message NodeReach {
+  // The node's name, as it announced itself. Never empty.
+  string node = 1;
+  // Connections between the sender and that node. 1 = directly connected to the
+  // sender, so a parent adds one on the way through.
+  //
+  // Bounded on receipt: an announcement claiming an absurd depth is a
+  // misconfiguration or a loop, and is dropped rather than stored.
+  uint32 hops = 2;
+  // What that node runs, if the sender knows. Empty means unknown, not none — a
+  // command for a service is then tried rather than refused on a guess.
+  repeated ServiceInfo services = 3;
+}
+
+// Ask a peer what it knows: who is connected, and what do they run.
+//
+// Answered only for a peer entitled to route commands — an operator, or the tier
+// above. A compute node has no business enumerating the cluster.
+message Status {
+  // Unique per connection; the matching StatusReport carries the same id.
+  uint64 id = 1;
+}
+
+// The answer to exactly one Status.
+message StatusReport {
+  // The id of the Status being answered.
+  uint64 id = 1;
+  // Who is answering.
+  string node = 2;
+  // The answering build, for operators. Advisory.
+  string build = 3;
+  // How long this engine has been running, in milliseconds. A duration, not a
+  // timestamp: nothing here compares two peers' clocks.
+  uint64 uptime_ms = 4;
+  // Every node the answering engine can reach, direct and indirect.
+  repeated KnownNode nodes = 5;
+}
+
+// One node an engine can reach, as reported to an operator.
+message KnownNode {
+  // The node's name.
+  string node = 1;
+  // The direct peer this node is behind, or empty when it *is* a direct peer.
+  string via = 2;
+  // Where a direct peer connected from. Empty for an indirect one.
+  string endpoint = 3;
+  // How long a direct peer has been connected, in milliseconds. 0 when unknown,
+  // which is every indirect node: only the tier it is attached to knows.
+  uint64 connected_ms = 4;
+  // Connections away. 1 for a direct peer.
+  uint32 hops = 5;
+  // What it runs, when known.
+  repeated ServiceInfo services = 6;
 }
 
 // Proof of life, sent on the control lane when a connection would otherwise be

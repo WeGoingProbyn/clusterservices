@@ -105,6 +105,13 @@ crates/
     engine/        cs-engine      NodeEngine, peer table, lanes, command queues,
                                   service registry + supervision, shutdown,
                                   TokioClock, JobSource. DONE.
+    operator/      cs-operator    The operator side of the command protocol:
+                                  connect to a head's admin endpoint, send commands
+                                  naming nodes, collect the answers. Not an engine —
+                                  no services, no queues, no reconnect. Depends on
+                                  the cs-transport traits only, so `cs-ctl` drives it
+                                  over TCP and the engine's own tests drive the same
+                                  code over the mock. DONE.
     testkit/       cs-testkit     TestCluster harness, misbehaving test plugins,
                                   and the transport contract suite generic over
                                   TestTransport. The one crate exempt from the
@@ -122,10 +129,22 @@ crates/
                                   `<service>/<worker>` convention was for. Plus
                                   `FakeProc` behind `test-util`. DONE.
     gpu/           cs-plugin-gpu      (later)
-apps/              (later)
-  agent/           cs-agent       binary: registers samplers, picks transport
-  server/          cs-server      binary: registers handlers, admin port
-  ctl/             cs-ctl         operator CLI (hostlist-style --nodes)
+apps/
+  agent/           cs-agent       binary: dials a head and registers samplers.
+                                  Runs `selfmon` always, `cgroup` only when
+                                  `--cgroups` says where to look (nothing to read
+                                  off a Slurm node), and `burn` — a load generator
+                                  that lives in the binary, not in `crates/`,
+                                  because it is a development aid. DONE.
+  server/          cs-server      binary: accepts agents and logs what they send,
+                                  one line per batch naming the node, the job, the
+                                  deltas, and which metrics the kernel lacked.
+                                  Enough to develop an agent against. DONE
+                                  (no storage, no admin port).
+  ctl/             cs-ctl         operator CLI: `restart` / `shutdown`, hostlist
+                                  `--nodes node-[1-4,7]` with padding preserved,
+                                  one line per node and an exit status that says
+                                  whether every one of them said ok. DONE.
 ```
 
 Later transports: `transport_grpc` (tonic bidi stream
@@ -142,10 +161,16 @@ libfabric via FFI, progress thread bridged to async).
 3. Transport impls depend on `cs-transport` (+ tokio), never on `cs-engine`.
 4. `cs-engine` depends on the `cs-transport` traits, never on an impl.
 5. Only `apps/*` and `cs-testkit` depend on concrete transports; each non-mock
-   transport sits behind a Cargo feature.
-6. Transport chosen once at startup:
-   `match cfg.transport { Tcp => run(NodeEngine::new(TcpTransport::new(..)?)) , .. }`.
-   The engine stays generic (`NodeEngine<T: Transport>`); no `Box<dyn Transport>`.
+   transport sits behind a Cargo feature. `cs-operator` is on the same footing as a
+   transport impl for this purpose: it takes a `T: Transport` and never names one.
+6. Transport chosen once at startup, by a `match` whose arms each call a generic
+   `run<T: Transport>(..)`. `Box<dyn Transport>` is not merely discouraged, it is
+   **impossible**: `Transport::connect` returns `impl Future`, so the trait is not
+   dyn-compatible. The engine stays generic (`NodeEngine<T: Transport>`).
+   **Dispatch on the endpoint's own scheme**, as `cs-server` does — `tcp://…`
+   selects the TCP transport, and a later `grpc://…` is one more arm with no
+   separate setting to keep in step. A scheme with no feature compiled in is an
+   `ErrorKind::Config` naming it.
 
 ## Key types (reference)
 
@@ -191,6 +216,15 @@ impl ServiceId {
 pub trait ServiceBound: 'static { type Service: ServiceDef; }
 pub type Data<T> = <<T as ServiceBound>::Service as ServiceDef>::Data;
 pub type Cmd<T>  = <<T as ServiceBound>::Service as ServiceDef>::Command;
+
+// A message type with no values, aliased to say which kind is absent:
+// `NoCommand` for a service taking no custom commands, `NoData` for one that
+// sends nothing. `Vec<NoData>` cannot be non-empty, so `Sampler::sample`
+// returning it is silence the compiler checks — which is what `burn` needs, a
+// service whose entire effect is local.
+pub enum Never {}
+pub type NoCommand = Never;
+pub type NoData = Never;
 
 pub enum Command<C> { Shutdown, Restart, Custom(C) }
 pub enum Reply { Default, Handled, Rejected(String) }
@@ -273,6 +307,18 @@ pub enum Frame {
     Command(CommandFrame), CommandResult(CommandResult), Heartbeat(Heartbeat),
 }
 pub enum Lane { Control, Data }            // Ord: Control sorts first, matching drain order
+
+pub enum Frame {
+    Data, Hello, Goodbye, Command, CommandResult, Heartbeat,
+    Reachable(Reachable),          // what a tier below can reach; sent upward
+    Status(StatusRequest),         // what do you know?
+    StatusReport(StatusReport),    // this, and how long I have been up
+}
+
+// `CommandFrame.node`: which node this is for, when that is not the peer being
+// sent to. Empty on the server -> agent hop (the connection already says which
+// node, and a second answer could only disagree); set by an operator, whose one
+// connection reaches every node the head serves, and by a tier forwarding down.
 pub enum CommandKind { Shutdown, Restart, Custom(Bytes) }
 pub enum Outcome { Ok, Unsupported, Rejected(String), Expired, UnknownService, Failed(ErrorTrace) }
 
@@ -382,6 +428,116 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
 - Agent restart = graceful shutdown then exit with a dedicated exit code;
   systemd (`RestartForceExitStatus=`) restarts it. No self re-exec.
 
+**Operators**
+- An operator is a peer on a **second listen endpoint** (`EngineBuilder::admin`),
+  and that is the whole of the authorization: a command arriving there may name any
+  node the head serves and is forwarded to it; the same command on the agents'
+  endpoint is resolved against the head's own services, which is to say refused.
+  **Nothing in this protocol authenticates anybody**, so the bind address is the only
+  lock on a fleet-wide restart button — hence a default of `127.0.0.1:7788` and a
+  note in `--help` saying why.
+- The role comes from **how the connection came to exist** — which endpoint it
+  arrived on, or that we dialled it — never from anything the peer claims about
+  itself. A flag in `Hello` would be a request to be trusted. There are three:
+  `Node` (accepted below us: its commands are for our own services and may name
+  nobody else), `Upstream` (the peer we dialled, trusted by construction, and the one
+  that sends commands for nodes we serve), and `Operator` (the admin endpoint, same
+  routing rights).
+- An operator is **not in the peer table**. It is not a node: nothing is addressed to
+  it by name, it produces no data, and two operators on one host would otherwise
+  collide on a name and evict each other.
+- **An operator's command is not queued for a node that is away.** A handler's is —
+  that is automation, and it can wait — but an operator is a person watching a
+  terminal, and "node-7 is not connected" now beats the same answer in sixty seconds.
+  Undeliverable comes back as `Failed(ErrorTrace)`, so the reason reads as an error
+  chain rather than an outcome that has to be guessed at.
+- A command **for us** — naming no node, or naming this engine — is carried out one
+  at a time on the connection's own task, which is what preserves per-service
+  ordering. Only commands for somebody else are passed on concurrently.
+- Forwarded commands are **not serialised** against each other, unlike a local one.
+  The invariant serialisation protects is per-service ordering, and that survives
+  because each one goes onto the target node's own ordered control queue; a hostlist
+  of a thousand nodes cannot wait for a thousand TTLs in turn.
+- The TTL is recomputed on each hop, as everywhere else, so two hops need no more
+  clock agreement than one.
+- **An operator has to heartbeat.** It is a peer like any other, so `peer_timeout`
+  applies to it, and an operator waiting on a slow node is silent. `cs-operator` sends
+  one every 5s, which suits the default 45s timeout; a head configured tighter needs
+  `with_heartbeat`.
+
+**Tiers**
+- A **relay is an engine in both roles** — `listen` for the tier below, `dial` for
+  the tier above — which the engine always supported. What was missing, and now
+  exists, is everything that crosses a tier for *commands*.
+- **Reachability is announced, not asked for.** Any engine that both listens and
+  dials sends `Reachable` upward on connecting and whenever what it serves changes:
+  its own children at one hop, plus everything they announced one hop further.
+  A leaf agent sends none — its name is in its `Hello` and it serves nobody.
+- **Always the full set, never a delta**, for the same reason command TTLs are
+  relative: state that can drift between two peers is state that will. A parent
+  replaces everything it knew about that child, so a lost announcement costs a moment
+  of staleness instead of a permanently wrong table. The empty announcement is
+  meaningful — it retires the last node behind a relay.
+- Announcements are **coalesced** over `reachability_interval` (5s), because five
+  hundred agents reconnecting together is one change, not five hundred.
+- The parent keeps `announced` **per child** and derives a flat `node → route` table
+  from it, rebuilt on every announcement: dispatching a command is then one lookup
+  rather than a scan. Keeping it per child is what makes a child's contribution
+  removable at all.
+- Two children claiming one node is a real misconfiguration (a node dialling two
+  relays). The nearer wins and the collision is logged rather than resolved silently.
+  `MAX_HOPS` (8) bounds a loop or a peer talking nonsense, and an announcement
+  claiming to reach *us* is dropped.
+- **Routing a command is the same code as an operator's command**, which is why the
+  two arrived together: `Command.node` names the target, the frame goes to the child
+  that serves it, and the in-flight entry is keyed on **the child** — so a child that
+  disconnects abandons it rather than leaving it waiting for a node it can no longer
+  reach.
+- What is **not** built: a relay cannot forward *data* upward. A batch for a service
+  it has no handler for is counted and dropped, as before. That needs `Data.origin`
+  (additive) and the chunk-size arithmetic to account for it, plus a decision about
+  whether a middle tier forwards or aggregates. Until then a relay carries commands
+  and reachability only, and `Origin { node, via }` in cs-api is ready for the day it
+  carries data.
+
+**Status**
+- `Status`/`StatusReport` answer "who is connected, and what do they run", from the
+  same tables routing uses — so it shows what is behind a relay, with `via` and
+  `hops`, and `cs-ctl status` at the global tier lists nodes it has never spoken to.
+- `connected` is `None` for an indirect node and set for a direct one: **only the tier
+  a node is attached to knows how long it has been there**, and inventing it would
+  make a guess look like a measurement.
+- Everything is a **duration**, never a timestamp. Nothing in this protocol compares
+  two peers' clocks.
+- Answered only for a peer that `may_query()`, which is the same set that may route:
+  an operator and the tier above. From a compute node it is counted and dropped — it
+  has no use for the cluster's inventory, and a peer that can route commands could
+  discover the same list by trying them.
+
+**Liveness**
+- Heartbeats go out on the control lane when a connection has been idle for
+  `heartbeat_interval`; **any** frame resets the idle timer, so a busy connection
+  never pays for them.
+- `peer_timeout` (default 3× the heartbeat) drops a peer that has said nothing at
+  all. This is the only defence against a **half-open connection**: a node that
+  loses power sends no `FIN` and no `RST`, so writes keep succeeding into nothing
+  and reads never return. Without it a server believes that agent is connected
+  until TCP's keepalive notices — hours — and every command queued for it is
+  delivered into the void.
+- The check lives in the read loop, which already knows when it last heard
+  anything; no watchdog task, no shared state. `Ended::Silent` is retryable, so an
+  agent redials and a server simply drops the peer.
+- `validate()` requires `peer_timeout >= 2 * heartbeat_interval`, so one lost
+  heartbeat cannot drop a healthy connection. It cannot check the thing that
+  actually matters, though: a **server's timeout must exceed its agents'
+  heartbeat interval**, and that is a cross-node configuration question no single
+  engine can see.
+- `EngineStats::peer_timeouts` is separate from `reconnects` on purpose: a
+  reconnect after a clean close is ordinary, a timeout means a peer stopped
+  answering without saying so.
+- The mock models this with `Link::blackhole(direction)` — frames are counted as
+  sent and then discarded, leaving the link up and silent.
+
 **Shutdown ordering**
 - One sequence for both roles, in this order, all under one deadline (default
   10s): services stop (each flushing `on_shutdown` into the queue) → plugin
@@ -469,6 +625,118 @@ indistinguishable from "no jobs to report", and the error type earns nothing.
 - Server may route a service's output to a same-process handler via a local
   peer that skips the transport.
 
+## Design notes (not built)
+
+### Tiers: agent → relay → cluster head → global
+<!-- Mostly built now; what is left is marked below. -->
+
+The intended shape is more than one cluster, each with a head, and a tier above
+them all:
+
+```
+                         global
+                  /                  \
+          cluster-a head        cluster-b head
+           /        \                 |
+       relay      relay             relay
+       /  \        /  \            /   \
+    agents      agents           agents
+```
+
+**This works now, for commands.** Every middle tier is an engine in both roles —
+`listen` for the tier below, `dial` for the tier above — and two of the three things
+that had to exist for a tier to be crossed have been built:
+
+1. ~~**`Hello` advertises only the peer's own services.**~~ Done: `Reachable`
+   announcements, the full set each time, coalesced, with a `node → child` table
+   derived from them. See **Tiers** under the behavioural contracts.
+2. ~~**A relay must forward a command addressed to a node it serves.**~~ Done: the
+   same code that carries an operator's command, which is why the two arrived
+   together. `cs-ctl status` at a global head lists nodes it has never spoken to, and
+   `cs-ctl restart -n node-1` from there reaches a node two tiers down.
+3. **Data carries no origin.** Still true, and now the only gap. `Data` has
+   `service`, `service_version` and `payload`; who produced it is implicit in which
+   connection it arrived on, which is correct with two tiers and wrong with three — a
+   relay forwarding upward would have the head attribute every agent's metrics to the
+   relay. Needs a `Data.origin` field (additive), set by the first tier that forwards;
+   `Origin { node, via }` in cs-api is already the shape a handler sees.
+
+   Two things make it more than adding a field. `DataFrame::max_payload` decides the
+   chunk size and would have to account for the origin's length — that figure must not
+   be hand-derived. And there is a policy question a field does not answer: does a
+   middle tier forward a batch it has no handler for, or aggregate it? Today it counts
+   and drops it, which is at least visible rather than wrong. **The one thing that was not additive has been done**: `Origin` in `cs-api`
+now distinguishes `node` (who produced this) from `via` (who delivered it). That
+is a plugin-facing *semantic*, and a handler written against "`node` is who I am
+talking to" would silently attribute a whole rack to a relay the day one appeared.
+They are equal in every two-tier deployment and there is a test pinning it.
+
+Two further consequences, recorded so they are not rediscovered late:
+
+- **Node names must be qualified above a cluster.** `node-1` exists in every
+  cluster. Storage at the global tier keys on (cluster head, origin) rather than
+  origin alone; commands address a path — `clusterA/node-1` — which needs no
+  protocol change, because `CommandRequest.node` is already a string and each tier
+  strips its own prefix as it forwards.
+- ~~**A tier that forwards commands needs a `node → child` table**~~, built from the
+  reachability announcements above. Built: `Inner::routes`, derived from what each
+  child announced. This is where the relay tier wins over independent servers — that
+  table is local knowledge, refreshed by the peers themselves, where N independent
+  servers would need a distributed directory that stays correct while nodes move.
+
+### Several servers sharing the load
+
+The agent takes one `dial` endpoint today. Spreading a cluster across several
+servers needs three things, and only the first is easy.
+
+1. **An ordered list with failover.** `dial(endpoint)` becomes
+   `dial([endpoints])` plus a policy, and the dial loop advances on failure and
+   resets on success. Backoff must apply per *cycle* through the list, not per
+   endpoint, or an agent with five servers hammers all five before it ever waits.
+   Useful under every design below, including a redundant relay pair.
+
+2. **Command routing, which is the actual problem.** Server-side state is not
+   stateless: commands are queued *per node* on the server that issued them. If an
+   operator tells server A to restart a service on node-7 while node-7 is
+   connected to server B, A's queue never delivers it. That needs either a shared
+   node→server directory, an operator-facing layer that routes to the right
+   server, or servers forwarding to each other.
+
+3. **Metric continuity across a move.** The server differences cumulative counters
+   to get rates. When node-7 moves from A to B, B has no previous value, so the
+   first batch after the move yields no rate — recoverable, and a real payoff of
+   the cumulative-counters rule, since pre-computed rates would have produced a
+   *wrong* number instead of a missing one. The storage layer must treat "first
+   sighting of this series" as "no rate yet", never as "counter jumped from zero".
+
+**A relay tier is probably the better answer than N independent servers**, and
+this document already anticipated it ("a relay is just an engine in both roles").
+The
+deciding argument is (2): a relay knows exactly which agents are connected to it,
+so forwarding a command downward is a **local** table lookup, whereas independent
+servers need a distributed directory that has to stay correct while nodes move.
+The relay also collapses the central server's peer count from ten thousand to
+tens, which is the scaling win that matters. What it needs that does not exist
+yet: a relay must *forward* a command addressed to a node it serves, rather than
+only resolving commands against its own services.
+
+**Topology belongs in whatever writes the agent's config, not in the agent.** An
+agent that queried Slurm for the switch hierarchy would need a Slurm dependency,
+credentials, and a reason to be trusted with them. An ordered server list *is* the
+topology decision, already made by whatever provisions the node — so the framework
+only ever needs the list and a failover policy, and stays free of Slurm entirely.
+
+### A Slurm API wrapper
+
+Worth building; worth building **outside this repo**. Slurm's OpenAPI spec changes
+shape between versions, so a wrapper that presents one stable API across them is
+real work with its own release cadence, and exporting it to Python through pyo3
+serves scripting users who will never run an agent. Nothing in `clusterservices`
+needs it: the agent reads cgroups, and the server is told node names by the agents
+themselves. The one place the two meet is generating agent configuration —
+including the topology-ordered server list above — which is a provisioning
+concern, not a framework one.
+
 ## Error handling
 
 All crates use `cs_util::Error` (boxed, one pointer wide).
@@ -491,7 +759,12 @@ All crates use `cs_util::Error` (boxed, one pointer wide).
   error's own `source()` chain, and yields `Frame { message, location, kind }`
   — this is exactly what gets flattened into `ErrorTrace` for the wire.
   Framework frames carry a location and kind; frames borrowed from inside a
-  foreign error's `source()` chain carry neither.
+  foreign error's `source()` chain carry neither, and so do frames rebuilt from a
+  remote trace — `Error::remote` / `remote_context` deliberately are **not**
+  `#[track_caller]`, because the caller is whatever is decoding the frame and the
+  real `file:line` is already folded into the message. Claiming both printed two
+  locations for one failure, which `cs-ctl` made obvious the first time it showed a
+  remote error.
 - `ErrorKind` is small and about **how to react**, not what happened:
   `Io, Transport, Decode, Config, Timeout, Rejected, Shutdown, Plugin`.
   Engine uses `is_retryable()` (Transport, Timeout → reconnect/backoff).
@@ -553,6 +826,11 @@ transport** first, then run the **same suite** against TCP.
   code must handle both shapes.
 - The mock serialises frames to bytes on the way through, so every test exercises
   encode/decode rather than passing Rust values around.
+- The **operator client is shared, not duplicated**: `cs-operator` is what `cs-ctl`
+  runs over TCP and what `TestCluster::operator` drives over the mock, so the six
+  forwarding tests in `crates/runtime/engine/tests/engine.rs` exercise the code that
+  ships. `connect_as` opens the same client on the *agents'* endpoint, which is how
+  "an agent cannot command another node" is tested at all.
 - `cs-testkit` provides `TestCluster` (one server + N agents in one process,
   controllable links) and test plugins: counter (sequence numbers for
   loss/dup detection), echo with custom command, rejects-restart,
@@ -594,9 +872,92 @@ transport** first, then run the **same suite** against TCP.
    run over TCP (`tests/engine_over_tcp.rs`) covering data, a command round trip,
    and an agent surviving a server restart.
 7. Plugins: ~~cgroup~~, ~~selfmon~~, then gpu. ← gpu next
-8. Apps: agent, server, ctl.
-9. Later: gRPC transport, relay/aggregation tier, eBPF network plugin,
-   RDMA transport.
+8. Apps: ~~server~~, ~~agent~~, ~~ctl~~ (`status`, `restart`, `shutdown`). Done.
+   Not built: custom commands from the CLI — a plugin's payload is its own type, so a
+   generic tool can only carry bytes it cannot construct; that wants a per-plugin
+   subcommand or a `--payload @file` escape hatch.
+9. ~~Reachability announcements and the routing table~~ — a relay carries commands and
+   answers `status` for nodes behind it. ← **`Data.origin` is what is left** before a
+   relay can carry metrics too.
+10. Later: gRPC transport, eBPF network plugin, RDMA transport.
+
+## What a binary owns
+
+The engine does none of this, and `apps/server` is the worked example:
+
+1. **Config.** `EngineConfig::validate()` runs inside `build()`, so a bad value
+   fails at startup with a named field rather than misbehaving later.
+2. **Logging.** The libraries emit `tracing` events; nothing installs a
+   subscriber, so until a binary does, every `info!` and `warn!` goes nowhere.
+3. **The transport match** — see rule 6.
+4. **Registration.** Samplers and a `JobSource` on an agent; handlers on a head.
+   Registering no `JobSource` is not the same as registering an empty one: the
+   engine then never starts the `jobs/scan` thread, so an agent running only
+   plugins that ignore the job list costs nothing for one. Found by reading the
+   agent's own thread list on its first run — which is what selfmon is for.
+5. **Signals.** SIGTERM/SIGINT → `EngineHandle::shutdown()`; a *second* signal
+   exits without waiting (130). Take the handle **before** `run()`, which consumes
+   the engine.
+6. **Exit status.** `Stop::Restart` → **75** (`EX_TEMPFAIL`), which a unit file
+   names in `RestartForceExitStatus=`. `Stop::Shutdown` → 0.
+
+An agent should use a `current_thread` runtime and a head a multi-threaded one:
+every blocking read already happens on its own named thread, so an agent's async
+side only shuffles frames, and one runtime thread instead of N both costs less and
+reads better in its own selfmon output.
+
+A binary is not exempt from the `unwrap`/`expect` ban.
+
+### Running the two of them
+
+```sh
+cargo run -p cs-server                                       # tcp://0.0.0.0:7777
+cargo run -p cs-agent -- --burn-threads 2 --burn-percent 60   # in another terminal
+```
+
+`burn` (`apps/agent/src/burn.rs`) is why that shows anything on a workstation: it
+spins threads on a duty cycle and sawtooths a ballast allocation, and because its
+workers are named `burn/spin0` the head prints their CPU **by name** next to the
+agent's own — the `<service>/<worker>` convention working end to end, which is
+otherwise only visible on a busy cluster. It is a plugin in every respect (depends
+on `cs-api` alone, registered as a factory, restartable) and so doubles as the
+smallest worked example of one; it lives in the binary rather than `crates/plugins/`
+because shipping a CPU waster as a library invites someone to enable it in
+production.
+
+Verified on this machine: `burn/spin0 +5.970s, burn/spin1 +5.990s` over a ten-second
+window at 60% duty on two threads, RSS following the ballast, and the batch flushed
+by `on_shutdown` arriving **before** the `Goodbye` — the shutdown ordering above,
+observed rather than asserted.
+
+### Installing them
+
+`packaging/` holds the two unit files and their environment files, checked in as
+static text — a `build.rs` cannot write outside `OUT_DIR`, runs before anyone has
+chosen an install path, and would have to guess `ExecStart=`. The units encode the
+contracts above rather than preferences: `Restart=on-failure` with
+`RestartForceExitStatus=75` (75 *is* the restart mechanism; exit 0 means an operator
+said shutdown and meant it, so `Restart=always` would make the two verbs
+indistinguishable), `TimeoutStopSec=20s` against the engine's own 10s deadline,
+`Slice=system.slice` so an agent is never under `slurmstepd.scope` looking like a
+job, and `After=slurmd.service` without `Requires=`, because an agent that starts
+early finds no jobs and says so while one that refuses to start is simply absent.
+
+### Operating a running cluster
+
+```sh
+cs-ctl status                                       # every node, direct or behind a relay
+cs-ctl status --nodes node-[1-4]                    # narrowed
+cs-ctl restart  --nodes node-[1-4,7] --service cgroup
+cs-ctl shutdown --nodes node-7                      # the whole agent
+cs-ctl restart  --nodes node-[1-100] --timeout 30 --head tcp://head01:7788
+```
+
+Exit status is the contract a script depends on: **0** every node said ok, **1** the
+head answered but some node did not, **2** no answer at all (no head, bad arguments,
+connection lost). A whole-agent `restart` makes the agent exit **75**, which its unit
+file turns back into a running agent; that is the only restart mechanism, and there
+is deliberately no self re-exec.
 
 ## Commands
 
@@ -609,6 +970,11 @@ cargo fmt --all
 
 Use `--all-features`: `test_support` and the doctests inside it are behind
 `test-util`, and later transports sit behind features of their own.
+
+Also run **`cargo build -p <crate>` for each crate**: a workspace build unifies
+features and so hides a crate that uses a tokio feature it never declared.
+`cs-transport-mock` shipped that way for weeks — `tokio::select!` without
+`features = ["macros"]` — and only failed when built alone.
 
 ## Conventions
 
